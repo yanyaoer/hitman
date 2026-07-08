@@ -17,10 +17,11 @@ const (
 // overridable via environment variables so the launchd plist / bridge script
 // can tune behaviour without touching code.
 type appConfig struct {
-	ListenAddr string // TLS listener codex is redirected to
-	SocksAddr  string // sing-box socks-in used for real egress
-	CADir      string // holds ai-bridge-ca.pem / .key
-	AuditDir   string // per-day audit output
+	ListenAddr string   // TLS listener codex is redirected to
+	SocksAddr  string   // sing-box socks-in used for real egress
+	CADir      string   // holds ai-bridge-ca.pem / .key
+	AuditDir   string   // per-day audit output
+	AllowHosts []string // upstream Host allowlist (exact or ".suffix"); empty = allow all
 
 	MarkerText     string
 	TruncationStep int
@@ -46,6 +47,7 @@ func loadConfig() appConfig {
 		SocksAddr:      envOr("AI_BRIDGE_SOCKS", "127.0.0.1:2333"),
 		CADir:          envOr("AI_BRIDGE_CA_DIR", "ca"),
 		AuditDir:       envOr("AI_BRIDGE_AUDIT_DIR", "audit"),
+		AllowHosts:     splitCSV(envOr("AI_BRIDGE_ALLOW_HOSTS", "chatgpt.com")),
 		MarkerText:     envOr("AI_BRIDGE_MARKER", defaultMarkerText),
 		TruncationStep: envInt("AI_BRIDGE_TRUNCATION_STEP", defaultTruncationStep),
 		MaxTierN:       envInt("AI_BRIDGE_MAX_TIER_N", defaultMaxTierN),
@@ -92,6 +94,16 @@ func envInt(key string, def int) int {
 		}
 	}
 	return def
+}
+
+func splitCSV(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func envBool(key string, def bool) bool {

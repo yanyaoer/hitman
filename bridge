@@ -10,12 +10,20 @@ SOCKS_PORT=2333
 CA_PEM="$DIR/ca/ai-bridge-ca.pem"
 PLIST_SRC="$DIR/$LABEL.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
-SB_CFG="$HOME/Library/Group Containers/287TTNZF8L.io.nekohasekai.sfavt/configs/config_2.json"
-SB_BIN="/opt/homebrew/bin/sing-box"
 GUI="gui/$(id -u)"
 
+# sing-box integration — supports two deployment modes:
+#   sfm : SFM.app (NetworkExtension); config lives in the group container, reload = reconnect the profile.
+#   cli : `sing-box run -c <cfg>` (manual or under launchd); reload = restart that process/service.
+# Mode + paths are auto-detected but fully overridable by env.
+SB_BIN="${AI_BRIDGE_SB_BIN:-/opt/homebrew/bin/sing-box}"
+SB_MODE="${AI_BRIDGE_SB_MODE:-auto}"                 # sfm | cli | auto
+TUN_INBOUND="${AI_BRIDGE_TUN_INBOUND:-tun-in}"       # inbound tag the redirect rule scopes to
+SFM_CFG="$HOME/Library/Group Containers/287TTNZF8L.io.nekohasekai.sfavt/configs/config_2.json"
+SB_CFG=""                                            # resolved lazily by sb_resolve
+
 # jq object for the redirect rule; idempotency key is override_port == PORT.
-REDIRECT_RULE='{"action":"route","inbound":["tun-in"],"process_name":["codex"],"domain":["chatgpt.com"],"override_address":"127.0.0.1","override_port":'"$PORT"'}'
+REDIRECT_RULE='{"action":"route","inbound":["'"$TUN_INBOUND"'"],"process_name":["codex"],"domain":["chatgpt.com"],"override_address":"127.0.0.1","override_port":'"$PORT"'}'
 
 die() { echo "ai-bridge: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
@@ -54,13 +62,62 @@ cmd_ca_untrust() {
   echo "CA trust removed"
 }
 
-# _sb_apply <jq-program> [jq-args...]: back up the sing-box config, run the jq
-# transform, validate with `sing-box check`, then atomically swap it in.
+# sb_cli_config sets SB_CFG to the first existing sing-box CLI config; returns 1 if none.
+sb_cli_config() {
+  local c
+  for c in "${AI_BRIDGE_SB_CONFIG:-}" "$HOME/.config/sing-box/config.json" \
+           /opt/homebrew/etc/sing-box/config.json /usr/local/etc/sing-box/config.json /etc/sing-box/config.json; do
+    if [ -n "$c" ] && [ -f "$c" ]; then SB_CFG="$c"; return 0; fi
+  done
+  return 1
+}
+
+# sb_resolve sets SB_CFG + SB_MODE from env / auto-detection; returns 1 if no config found.
+sb_resolve() {
+  if [ -n "${AI_BRIDGE_SB_CONFIG:-}" ]; then
+    SB_CFG="$AI_BRIDGE_SB_CONFIG"
+    [ -f "$SB_CFG" ] || return 1
+    case "$SB_MODE" in sfm|cli) : ;; *) case "$SB_CFG" in *sfavt*) SB_MODE=sfm ;; *) SB_MODE=cli ;; esac ;; esac
+    return 0
+  fi
+  case "$SB_MODE" in
+    sfm) SB_CFG="$SFM_CFG"; [ -f "$SB_CFG" ] || return 1; return 0 ;;
+    cli) sb_cli_config; return $? ;;
+    *)   if [ -f "$SFM_CFG" ]; then SB_MODE=sfm; SB_CFG="$SFM_CFG"; return 0; fi
+         SB_MODE=cli; sb_cli_config; return $? ;;
+  esac
+}
+
+# sb_reload applies the just-written config to the running sing-box (mode-specific).
+sb_reload() {
+  if [ -n "${AI_BRIDGE_SB_RELOAD:-}" ]; then
+    echo "reloading sing-box via AI_BRIDGE_SB_RELOAD..."; eval "$AI_BRIDGE_SB_RELOAD"; return 0
+  fi
+  case "$SB_MODE" in
+    sfm)
+      echo "NOTE: reload SFM — reconnect the active profile in the SFM app for the change to apply." ;;
+    cli)
+      if [ -n "${AI_BRIDGE_SB_LAUNCHD:-}" ]; then
+        launchctl kickstart -k "$GUI/$AI_BRIDGE_SB_LAUNCHD" 2>/dev/null \
+          || sudo launchctl kickstart -k "system/$AI_BRIDGE_SB_LAUNCHD" 2>/dev/null \
+          || echo "WARN: could not kickstart launchd service $AI_BRIDGE_SB_LAUNCHD"
+        echo "restarted sing-box launchd service $AI_BRIDGE_SB_LAUNCHD"
+      elif pgrep -x sing-box >/dev/null 2>&1; then
+        echo "NOTE: restart your sing-box CLI to load the new config (it does not hot-reload the config file):"
+        echo "      sudo $SB_BIN run -c \"$SB_CFG\"   (or set AI_BRIDGE_SB_RELOAD / AI_BRIDGE_SB_LAUNCHD)"
+      else
+        echo "NOTE: sing-box does not appear to be running; start it with the updated config."
+      fi ;;
+  esac
+}
+
+# _sb_apply <jq-program> [jq-args...]: resolve config, back up, run the jq transform,
+# validate with `sing-box check`, atomically swap it in, then reload (mode-aware).
 _sb_apply() {
   local prog="$1"; shift
   need jq
-  [ -x "$SB_BIN" ] || die "sing-box not found at $SB_BIN"
-  [ -f "$SB_CFG" ] || die "sing-box config not found at $SB_CFG"
+  [ -x "$SB_BIN" ] || die "sing-box not found at $SB_BIN (set AI_BRIDGE_SB_BIN)"
+  sb_resolve || die "no sing-box config found; set AI_BRIDGE_SB_CONFIG=/path/to/config.json"
   local ts tmp
   ts="$(date +%Y%m%dT%H%M%S)"
   cp "$SB_CFG" "$SB_CFG.bak-ai-bridge-$ts"
@@ -68,13 +125,22 @@ _sb_apply() {
   jq "$@" "$prog" "$SB_CFG" >"$tmp" || { rm -f "$tmp"; die "jq transform failed"; }
   "$SB_BIN" check -c "$tmp" || { rm -f "$tmp"; die "sing-box check failed; config unchanged (backup: $SB_CFG.bak-ai-bridge-$ts)"; }
   mv "$tmp" "$SB_CFG"
-  echo "sing-box config updated (backup: $SB_CFG.bak-ai-bridge-$ts). Reload SFM (reconnect the profile) to apply."
+  echo "[$SB_MODE] sing-box config updated: $SB_CFG (backup: $SB_CFG.bak-ai-bridge-$ts)"
+  sb_reload
 }
 
 cmd_singbox_patch() {
+  # Insert the redirect right after the leading sniff/hijack-dns rules so it takes
+  # priority over all real routing rules (first-match wins), regardless of how many
+  # sniff/dns rules precede them. Idempotent on override_port.
   _sb_apply '
+    def leadlen:
+      reduce .route.rules[] as $x ({n:0, stop:false};
+        if .stop then .
+        elif ($x.action == "sniff" or $x.action == "hijack-dns") then {n:(.n+1), stop:false}
+        else {n:.n, stop:true} end).n;
     if (.route.rules | any(.override_port? == '"$PORT"')) then .
-    else .route.rules = (.route.rules[0:2] + [$r] + .route.rules[2:]) end
+    else leadlen as $at | .route.rules = (.route.rules[0:$at] + [$r] + .route.rules[$at:]) end
   ' --argjson r "$REDIRECT_RULE"
 }
 
@@ -91,9 +157,11 @@ cmd_status() {
   echo "== listener :$PORT =="
   if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then echo "  listening"; else echo "  NOT listening"; fi
   echo "== sing-box socks :$SOCKS_PORT =="
-  if nc -z 127.0.0.1 "$SOCKS_PORT" >/dev/null 2>&1; then echo "  reachable"; else echo "  NOT reachable (start SFM)"; fi
+  if nc -z 127.0.0.1 "$SOCKS_PORT" >/dev/null 2>&1; then echo "  reachable"; else echo "  NOT reachable (start sing-box/SFM)"; fi
+  echo "== sing-box config =="
+  if sb_resolve; then echo "  mode=$SB_MODE  config=$SB_CFG"; else echo "  NOT found (set AI_BRIDGE_SB_CONFIG)"; fi
   echo "== redirect rule =="
-  if command -v jq >/dev/null 2>&1 && [ -f "$SB_CFG" ] && jq -e '.route.rules | any(.override_port? == '"$PORT"')' "$SB_CFG" >/dev/null 2>&1; then
+  if command -v jq >/dev/null 2>&1 && [ -n "$SB_CFG" ] && [ -f "$SB_CFG" ] && jq -e '.route.rules | any(.override_port? == '"$PORT"')' "$SB_CFG" >/dev/null 2>&1; then
     echo "  present (bridge ON)"; else echo "  absent (bridge OFF / direct)"; fi
   echo "== CA trust =="
   if security find-certificate -c "ai-bridge CA" /Library/Keychains/System.keychain >/dev/null 2>&1; then echo "  trusted"; else echo "  NOT trusted"; fi

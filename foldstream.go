@@ -192,8 +192,10 @@ func (fs *foldState) processAndEmit(payload []byte) (map[string]any, error) {
 		if jsonStart >= len(fs.sseBuffer) {
 			break
 		}
-		if jsonStart+5 <= len(fs.sseBuffer) && string(fs.sseBuffer[jsonStart:jsonStart+5]) == "[DONE]" {
-			fs.sseBuffer = fs.sseBuffer[jsonStart+5:]
+		// "[DONE]" is 6 bytes; the cpa original compares only 5 (a latent off-by-one,
+		// harmless there because the terminal event returns first). Fixed here.
+		if jsonStart+6 <= len(fs.sseBuffer) && string(fs.sseBuffer[jsonStart:jsonStart+6]) == "[DONE]" {
+			fs.sseBuffer = fs.sseBuffer[jsonStart+6:]
 			continue
 		}
 		if fs.sseBuffer[jsonStart] != '{' {

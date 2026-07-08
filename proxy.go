@@ -29,10 +29,26 @@ func newServer(cfg appConfig, audit *auditor) *server {
 		ResponseHeaderTimeout: 120 * time.Second,
 		ExpectContinueTimeout: 2 * time.Second,
 	}
-	return &server{cfg: cfg, audit: audit, client: &http.Client{Transport: transport}}
+	return &server{
+		cfg:   cfg,
+		audit: audit,
+		client: &http.Client{
+			Transport: transport,
+			// Forward 3xx verbatim to codex; a transparent proxy must not collapse
+			// upstream auth/redirect flows by following them itself.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+	}
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Defense in depth: only forward (and attach the client's own credentials) to
+	// allowlisted upstream hosts. sing-box already scopes what reaches us, but this
+	// prevents a misrouted/redirected request from leaking the Bearer to any Host.
+	if !hostAllowed(s.cfg.AllowHosts, r.Host) {
+		http.Error(w, "bridge: host not allowed: "+r.Host, http.StatusForbidden)
+		return
+	}
 	if r.Method == http.MethodPost && r.URL.Path == "/backend-api/codex/responses" {
 		s.handleResponses(w, r)
 		return
@@ -40,23 +56,53 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.handlePassthrough(w, r)
 }
 
+func hostAllowed(allow []string, host string) bool {
+	if len(allow) == 0 {
+		return true
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.ToLower(host)
+	for _, a := range allow {
+		a = strings.ToLower(strings.TrimSpace(a))
+		if a == "" {
+			continue
+		}
+		if host == a || strings.HasSuffix(host, "."+a) {
+			return true
+		}
+	}
+	return false
+}
+
 func upstreamURL(r *http.Request) string {
 	return "https://" + r.Host + r.URL.RequestURI()
 }
 
 func (s *server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
-	body, _ := io.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	_ = r.Body.Close()
 	rec := s.audit.begin(r, "passthrough", nil)
 	defer rec.done()
+	if err != nil {
+		http.Error(w, "bridge: read request body: "+err.Error(), http.StatusBadRequest)
+		rec.fields(map[string]any{"status": 400, "error": err.Error()})
+		return
+	}
 	s.forward(w, r, body, rec, false)
 }
 
 func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
-	body, _ := io.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	_ = r.Body.Close()
 	rec := s.audit.begin(r, "responses", body)
 	defer rec.done()
+	if err != nil {
+		http.Error(w, "bridge: read request body: "+err.Error(), http.StatusBadRequest)
+		rec.fields(map[string]any{"status": 400, "error": err.Error()})
+		return
+	}
 
 	var parsed map[string]any
 	if err := json.Unmarshal(body, &parsed); err != nil || !foldApplies(parsed) {
@@ -240,10 +286,19 @@ func socks5DialContext(socksAddr string) func(ctx context.Context, network, addr
 		if err != nil {
 			return nil, err
 		}
+		// Bound the handshake reads/writes: DialContext only covers the TCP connect,
+		// so without a deadline a socks server that accepts but never replies would
+		// hang the request forever and leak the conn.
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			deadline = time.Now().Add(15 * time.Second)
+		}
+		_ = conn.SetDeadline(deadline)
 		if err := socks5Handshake(conn, host, port); err != nil {
 			_ = conn.Close()
 			return nil, err
 		}
+		_ = conn.SetDeadline(time.Time{}) // clear for the streaming phase
 		return conn, nil
 	}
 }
