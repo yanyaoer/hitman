@@ -217,7 +217,7 @@ cmd_smoke() {
     "https://chatgpt.com/backend-api/codex/responses" \
     -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
     -H 'User-Agent: codex_cli_rs/0.142.5 (smoke)' \
-    -d '{"model":"gpt-5.5","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Reply with the single word ok"}]}],"reasoning":{"effort":"low"}}' || true)"
+    -d '{"model":"gpt-5.5","stream":true,"store":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Reply with the single word ok"}]}],"reasoning":{"effort":"low"}}' || true)"
   if grep -q proxy_rounds <<<"$out"; then
     echo "SMOKE PASS: response.completed carried metadata.proxy_rounds"
   else
