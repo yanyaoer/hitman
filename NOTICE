@@ -1,0 +1,18 @@
+ai-bridge
+
+This product includes derived work from the following MIT-licensed projects:
+
+- cpa-plugin-codexcomp (https://github.com/uf-hy/cpa-plugin-codexcomp)
+  fold.go is ported near-verbatim from its fold.go (commit 26875b5). The fold
+  state machine in foldstream.go is adapted from its executor.go.
+
+- codexcomp (https://github.com/dzshzx/codexcomp)
+  Original transport-agnostic fold algorithm (fold.py), from which the above
+  Go port derives.
+
+- CodexCont (https://github.com/neteroster/CodexCont)
+  Original discovery of the gpt-5.5 518n-2 reasoning-truncation pattern and the
+  encrypted_content replay continuation technique.
+
+The 518n-2 truncation/degradation issue was primarily investigated and verified
+by the LINUX DO community (https://linux.do).

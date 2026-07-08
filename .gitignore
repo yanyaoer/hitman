@@ -1,0 +1,18 @@
+# build artifacts
+/bin/
+*.exe
+
+# local CA (private key must never be committed)
+/ca/
+*.pem
+*.key
+
+# audit output (contains prompts / tokens)
+/audit/
+/logs/
+
+# build scratch
+/build/
+
+# macOS
+.DS_Store
