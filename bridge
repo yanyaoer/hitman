@@ -19,11 +19,16 @@ GUI="gui/$(id -u)"
 SB_BIN="${AI_BRIDGE_SB_BIN:-/opt/homebrew/bin/sing-box}"
 SB_MODE="${AI_BRIDGE_SB_MODE:-auto}"                 # sfm | cli | auto
 TUN_INBOUND="${AI_BRIDGE_TUN_INBOUND:-tun-in}"       # inbound tag the redirect rule scopes to
+DIRECT_OUTBOUND="${AI_BRIDGE_DIRECT_OUTBOUND:-DIRECT}" # a direct (non-proxy) outbound tag in the sing-box config
 SFM_CFG="$HOME/Library/Group Containers/287TTNZF8L.io.nekohasekai.sfavt/configs/config_2.json"
 SB_CFG=""                                            # resolved lazily by sb_resolve
 
-# jq object for the redirect rule; idempotency key is override_port == PORT.
-REDIRECT_RULE='{"action":"route","inbound":["'"$TUN_INBOUND"'"],"process_name":["codex"],"domain":["chatgpt.com"],"override_address":"127.0.0.1","override_port":'"$PORT"'}'
+# The redirect rule. outbound=DIRECT is REQUIRED: after override_address/port rewrite
+# the destination to 127.0.0.1:PORT, sing-box must dial it locally — without an
+# explicit direct outbound it falls to route.final (a proxy node), which then tries
+# to reach 127.0.0.1:PORT on the remote server and the connection is reset.
+# Idempotency key is override_port == PORT.
+REDIRECT_RULE='{"action":"route","inbound":["'"$TUN_INBOUND"'"],"process_name":["codex"],"domain":["chatgpt.com"],"outbound":"'"$DIRECT_OUTBOUND"'","override_address":"127.0.0.1","override_port":'"$PORT"'}'
 
 die() { echo "ai-bridge: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
@@ -156,17 +161,18 @@ _sb_apply() {
 }
 
 cmd_singbox_patch() {
-  # Insert the redirect right after the leading sniff/hijack-dns rules so it takes
-  # priority over all real routing rules (first-match wins), regardless of how many
-  # sniff/dns rules precede them. Idempotent on override_port.
+  # Remove any prior ai-bridge rule (match on override_port) then insert the current
+  # one right after the leading sniff/hijack-dns rules, so re-running `on` upgrades
+  # the rule in place and it takes priority over real routing rules (first-match wins).
   _sb_apply '
-    def leadlen:
-      reduce .route.rules[] as $x ({n:0, stop:false};
+    def leadlen($rules):
+      reduce $rules[] as $x ({n:0, stop:false};
         if .stop then .
         elif ($x.action == "sniff" or $x.action == "hijack-dns") then {n:(.n+1), stop:false}
         else {n:.n, stop:true} end).n;
-    if (.route.rules | any(.override_port? == '"$PORT"')) then .
-    else leadlen as $at | .route.rules = (.route.rules[0:$at] + [$r] + .route.rules[$at:]) end
+    (.route.rules | map(select(.override_port? != '"$PORT"'))) as $c
+    | leadlen($c) as $at
+    | .route.rules = ($c[0:$at] + [$r] + $c[$at:])
   ' --argjson r "$REDIRECT_RULE"
 }
 
