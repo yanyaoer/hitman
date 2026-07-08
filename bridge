@@ -175,11 +175,16 @@ cmd_smoke() {
   local token="${CODEX_TOKEN:-}"
   if [ -z "$token" ]; then token="$(jq -r '.tokens.access_token // empty' "$HOME/.codex/auth.json" 2>/dev/null || true)"; fi
   [ -n "$token" ] || die "no token: set CODEX_TOKEN or ensure ~/.codex/auth.json has .tokens.access_token"
+  if ! nc -z 127.0.0.1 "$SOCKS_PORT" >/dev/null 2>&1; then
+    die "sing-box socks $SOCKS_PORT not reachable — start SFM/sing-box first (upstream egress needs it)"
+  fi
   echo "sending gpt-5.5 stream through the bridge (chatgpt.com -> 127.0.0.1:$PORT)..."
+  # --connect-to keeps the URL host as chatgpt.com:443 (correct upstream port + Host header)
+  # while dialing the local bridge; --resolve would leak :$PORT into Host and upstream.
   local out
   out="$(curl -sN --max-time 300 \
-    --resolve "chatgpt.com:$PORT:127.0.0.1" --cacert "$CA_PEM" \
-    "https://chatgpt.com:$PORT/backend-api/codex/responses" \
+    --connect-to "chatgpt.com:443:127.0.0.1:$PORT" --cacert "$CA_PEM" \
+    "https://chatgpt.com/backend-api/codex/responses" \
     -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
     -H 'User-Agent: codex_cli_rs/0.142.5 (smoke)' \
     -d '{"model":"gpt-5.5","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Reply with the single word ok"}]}],"reasoning":{"effort":"low"}}' || true)"
