@@ -55,6 +55,13 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bridge: host not allowed: "+r.Host, http.StatusForbidden)
 		return
 	}
+	// Reject WebSocket upgrades fast so codex falls back to the HTTP/SSE responses
+	// transport, which is the path we fold. We deliberately do not proxy the WS
+	// transport (its frames would need parsing to fold).
+	if strings.Contains(strings.ToLower(r.Header.Get("Upgrade")), "websocket") {
+		http.Error(w, "bridge: websocket transport not supported; use HTTPS/SSE", http.StatusUpgradeRequired)
+		return
+	}
 	if r.Method == http.MethodPost && r.URL.Path == "/backend-api/codex/responses" {
 		s.handleResponses(w, r)
 		return

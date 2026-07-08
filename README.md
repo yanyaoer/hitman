@@ -112,6 +112,7 @@ audit/<date>/
 
 | 现象 | 原因 / 处理 |
 |---|---|
+| codex 启动时刷一串 `websocket ... Connection reset` / `Reconnecting...` | 正常。codex 默认先试 WebSocket 传输，bridge 只做 HTTP/SSE（才能折叠），会返回 426 让它快速回退到 HTTPS/SSE。有几秒延迟，之后正常。 |
 | codex 报证书错误 | codex 默认未认钥匙串根 → 回落 `CODEX_CA_CERTIFICATE=<ca.pem>`（launchd 注入，仍不碰 `config.toml`） |
 | 流量没被拦截 | `process_name` 匹配在 SFM 下不生效 → 去掉规则里的 `process_name`（改为 host 级重定向），ai-bridge 会透传非 codex 流量 |
 | 重定向规则消失 | SFM 更新订阅覆盖了手改 → 重跑 `./bridge on`；`./bridge status` 可检测规则是否在位 |

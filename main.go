@@ -40,7 +40,12 @@ func main() {
 	tlsCfg := &tls.Config{
 		GetCertificate: minter.getCertificate,
 		MinVersion:     tls.VersionTLS12,
-		NextProtos:     []string{"h2", "http/1.1"},
+		// http/1.1 only: codex negotiates WebSocket-over-h2 (RFC 8441 extended
+		// CONNECT) for the responses endpoint, which Go's h2 server rejects and
+		// resets the whole multiplexed connection. Forcing http/1.1 keeps every
+		// codex request on a transport our handler serves, and lets codex fall
+		// back to the HTTP/SSE path we fold.
+		NextProtos: []string{"http/1.1"},
 	}
 	httpServer := &http.Server{Addr: cfg.ListenAddr, Handler: srv, TLSConfig: tlsCfg}
 
