@@ -1,5 +1,6 @@
 # build artifacts
 /bin/
+/ai-bridge
 *.exe
 
 # local CA (private key must never be committed)
