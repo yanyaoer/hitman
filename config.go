@@ -44,7 +44,7 @@ type foldConfig struct {
 func loadConfig() appConfig {
 	c := appConfig{
 		ListenAddr:     envOr("AI_BRIDGE_LISTEN", "127.0.0.1:8471"),
-		SocksAddr:      envOr("AI_BRIDGE_SOCKS", "127.0.0.1:2333"),
+		SocksAddr:      normalizeSocks(envOr("AI_BRIDGE_SOCKS", "127.0.0.1:2333")),
 		CADir:          envOr("AI_BRIDGE_CA_DIR", "ca"),
 		AuditDir:       envOr("AI_BRIDGE_AUDIT_DIR", "audit"),
 		AllowHosts:     splitCSV(envOr("AI_BRIDGE_ALLOW_HOSTS", "chatgpt.com")),
@@ -94,6 +94,18 @@ func envInt(key string, def int) int {
 		}
 	}
 	return def
+}
+
+// normalizeSocks maps the "direct" sentinels to an empty SocksAddr, which selects
+// direct egress (dial the upstream straight, letting the sing-box TUN capture it).
+// Useful when strict_route makes the socks inbound unreachable from local processes.
+func normalizeSocks(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "direct", "none", "off", "-":
+		return ""
+	default:
+		return v
+	}
 }
 
 func splitCSV(s string) []string {

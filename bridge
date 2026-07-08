@@ -50,6 +50,32 @@ cmd_uninstall() {
 
 cmd_restart() { launchctl kickstart -k "$GUI/$LABEL"; echo "restarted $LABEL"; }
 
+# egress <socks [addr] | direct>: set how ai-bridge reaches the upstream.
+#   socks : dial via sing-box socks-in (default 127.0.0.1:2333) — needs the socks port reachable.
+#   direct: dial chatgpt.com straight and let the sing-box TUN capture it — use when
+#           strict_route blocks the socks inbound. Loop-safe only with process-scoped redirect.
+cmd_egress() {
+  local mode="${1:-}" addr="${2:-127.0.0.1:2333}" val pb=/usr/libexec/PlistBuddy
+  case "$mode" in
+    direct) val="direct" ;;
+    socks)  val="$addr" ;;
+    *) die "usage: bridge egress <socks [addr] | direct>" ;;
+  esac
+  # Update both the source plist and the installed one, then restart.
+  for p in "$PLIST_SRC" "$PLIST_DST"; do
+    [ -f "$p" ] || continue
+    "$pb" -c "Set :EnvironmentVariables:AI_BRIDGE_SOCKS $val" "$p" 2>/dev/null \
+      || "$pb" -c "Add :EnvironmentVariables:AI_BRIDGE_SOCKS string $val" "$p"
+  done
+  echo "egress set to: $val"
+  if [ -f "$PLIST_DST" ]; then
+    launchctl bootout "$GUI/$LABEL" 2>/dev/null || true
+    launchctl bootstrap "$GUI" "$PLIST_DST" 2>/dev/null || true
+    launchctl kickstart -k "$GUI/$LABEL"
+    echo "restarted $LABEL"
+  fi
+}
+
 cmd_ca_trust() {
   [ -f "$CA_PEM" ] || die "CA not found at $CA_PEM (run the service once first: ./bridge install)"
   echo "adding CA to System keychain (admin password required)..."
@@ -156,8 +182,11 @@ cmd_status() {
   launchctl print "$GUI/$LABEL" 2>/dev/null | awk '/state = /{print; exit}' || echo "  not loaded"
   echo "== listener :$PORT =="
   if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then echo "  listening"; else echo "  NOT listening"; fi
+  echo "== egress =="
+  local eg="socks"; [ -f "$PLIST_DST" ] && eg="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:AI_BRIDGE_SOCKS' "$PLIST_DST" 2>/dev/null || echo '127.0.0.1:2333')"
+  case "$eg" in ""|direct|none|off|-) echo "  direct (via TUN)";; *) echo "  socks $eg";; esac
   echo "== sing-box socks :$SOCKS_PORT =="
-  if nc -z 127.0.0.1 "$SOCKS_PORT" >/dev/null 2>&1; then echo "  reachable"; else echo "  NOT reachable (start sing-box/SFM)"; fi
+  if nc -z 127.0.0.1 "$SOCKS_PORT" >/dev/null 2>&1; then echo "  reachable"; else echo "  NOT reachable (ok if egress=direct)"; fi
   echo "== sing-box config =="
   if sb_resolve; then echo "  mode=$SB_MODE  config=$SB_CFG"; else echo "  NOT found (set AI_BRIDGE_SB_CONFIG)"; fi
   echo "== redirect rule =="
@@ -176,7 +205,8 @@ cmd_smoke() {
   if [ -z "$token" ]; then token="$(jq -r '.tokens.access_token // empty' "$HOME/.codex/auth.json" 2>/dev/null || true)"; fi
   [ -n "$token" ] || die "no token: set CODEX_TOKEN or ensure ~/.codex/auth.json has .tokens.access_token"
   if ! nc -z 127.0.0.1 "$SOCKS_PORT" >/dev/null 2>&1; then
-    die "sing-box socks $SOCKS_PORT not reachable — start SFM/sing-box first (upstream egress needs it)"
+    echo "WARN: socks $SOCKS_PORT not reachable. If egress=socks this smoke will fail;" >&2
+    echo "      if strict_route blocks the socks inbound, switch: ./bridge egress direct" >&2
   fi
   echo "sending gpt-5.5 stream through the bridge (chatgpt.com -> 127.0.0.1:$PORT)..."
   # --connect-to keeps the URL host as chatgpt.com:443 (correct upstream port + Host header)
@@ -217,6 +247,7 @@ Usage: ./bridge <command>
   install          copy plist + launchd bootstrap + start (auto-creates CA on first run)
   uninstall        stop + remove launchd service
   restart          kickstart the service
+  egress <mode>    set upstream egress: 'socks [addr]' (default 2333) or 'direct' (via TUN)
   ca-trust         add local CA to System keychain (sudo)
   ca-untrust       remove local CA from System keychain (sudo)
   on               add sing-box redirect rule (codex -> bridge)
@@ -235,6 +266,7 @@ case "${1:-}" in
   install) cmd_install ;;
   uninstall) cmd_uninstall ;;
   restart) cmd_restart ;;
+  egress) cmd_egress "${2:-}" "${3:-}" ;;
   ca-trust) cmd_ca_trust ;;
   ca-untrust) cmd_ca_untrust ;;
   on) cmd_on ;;

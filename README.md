@@ -100,7 +100,7 @@ audit/<date>/
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `AI_BRIDGE_LISTEN` | `127.0.0.1:8471` | MITM 监听地址 |
-| `AI_BRIDGE_SOCKS` | `127.0.0.1:2333` | 上游出口 socks5 |
+| `AI_BRIDGE_SOCKS` | `127.0.0.1:2333` | 上游出口：socks5 地址，或 `direct`（直连，由 TUN 捕获）|
 | `AI_BRIDGE_ALLOW_HOSTS` | `chatgpt.com` | 允许转发的上游 Host（逗号分隔，精确或 `.后缀`）；空=不限制 |
 | `AI_BRIDGE_MAX_CONTINUE` | `3` | 最多续写轮数；`0` 关闭折叠（A/B 基线） |
 | `AI_BRIDGE_MAX_TIER_N` | `6` | 允许续写的最大截断层级 |
@@ -116,7 +116,20 @@ audit/<date>/
 | 流量没被拦截 | `process_name` 匹配在 SFM 下不生效 → 去掉规则里的 `process_name`（改为 host 级重定向），ai-bridge 会透传非 codex 流量 |
 | 重定向规则消失 | SFM 更新订阅覆盖了手改 → 重跑 `./bridge on`；`./bridge status` 可检测规则是否在位 |
 | bridge 掉线 | launchd 自愈；或 `./bridge off` 回官方直连 |
+| socks 2333 连不上（但 SFM 在跑） | sing-box `strict_route: true` 会阻止本机进程连它自己的 socks 入站。改用直连出口：`./bridge egress direct`（ai-bridge 直接拨 chatgpt.com，由 TUN 捕获转发） |
 | socks 不通 | SFM/TUN 未运行 → 启动 SFM；`./bridge status` 探测 2333 |
+
+## 出口模式（socks / direct）
+
+ai-bridge 到上游有两种走法，`./bridge egress <mode>` 切换（改 plist 并重启服务）：
+
+- `socks`（默认 `127.0.0.1:2333`）：经 sing-box socks 入站出海。**需要该端口本机可连**——但很多 TUN 配置开了
+  `strict_route: true`，会让本机进程连不上 socks 入站（表现为连接超时，尽管 `sudo lsof` 能看到在监听）。
+- `direct`：ai-bridge 直接拨 `chatgpt.com:443`，由 sing-box 的 TUN 捕获并按节点路由。**推荐在 SFM/strict_route 下用**。
+
+> ⚠️ `direct` 出口**仅在按进程重定向（规则含 `process_name: ["codex"]`）时安全**：ai-bridge 自身进程不匹配 codex，
+> 故不会被回环重定向。若改用 **host 级重定向**（去掉 `process_name`），`direct` 会把 ai-bridge 自己的上游请求也
+> 重定向回自己造成**死循环**——那种情况必须用 socks 出口（或在 sing-box 里把 ai-bridge 的流量排除）。
 
 ## 致谢
 

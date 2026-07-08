@@ -48,7 +48,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("fatal: listen %s: %v", cfg.ListenAddr, err)
 	}
-	log.Printf("listening on https://%s (socks %s, audit %s, ca %s)", cfg.ListenAddr, cfg.SocksAddr, cfg.AuditDir, cfg.CADir)
+	egress := "direct (via TUN)"
+	if cfg.SocksAddr != "" {
+		egress = "socks " + cfg.SocksAddr
+	}
+	log.Printf("listening on https://%s (egress %s, audit %s, ca %s)", cfg.ListenAddr, egress, cfg.AuditDir, cfg.CADir)
 
 	go func() {
 		if err := httpServer.ServeTLS(ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {

@@ -21,13 +21,19 @@ type server struct {
 
 func newServer(cfg appConfig, audit *auditor) *server {
 	transport := &http.Transport{
-		DialContext:           socks5DialContext(cfg.SocksAddr),
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   20 * time.Second,
 		ResponseHeaderTimeout: 120 * time.Second,
 		ExpectContinueTimeout: 2 * time.Second,
+	}
+	if cfg.SocksAddr == "" {
+		// Direct egress: dial the upstream straight and let the sing-box TUN capture
+		// and route it (works under strict_route, which can block the socks inbound).
+		transport.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	} else {
+		transport.DialContext = socks5DialContext(cfg.SocksAddr)
 	}
 	return &server{
 		cfg:   cfg,
