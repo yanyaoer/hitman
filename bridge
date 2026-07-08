@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# ai-bridge control script. Manages build, CA trust, the sing-box redirect rule,
+# the launchd service, and smoke tests. See README.md.
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LABEL="com.yanyao.ai-bridge"
+PORT=8471
+SOCKS_PORT=2333
+CA_PEM="$DIR/ca/ai-bridge-ca.pem"
+PLIST_SRC="$DIR/$LABEL.plist"
+PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
+SB_CFG="$HOME/Library/Group Containers/287TTNZF8L.io.nekohasekai.sfavt/configs/config_2.json"
+SB_BIN="/opt/homebrew/bin/sing-box"
+GUI="gui/$(id -u)"
+
+# jq object for the redirect rule; idempotency key is override_port == PORT.
+REDIRECT_RULE='{"action":"route","inbound":["tun-in"],"process_name":["codex"],"domain":["chatgpt.com"],"override_address":"127.0.0.1","override_port":'"$PORT"'}'
+
+die() { echo "ai-bridge: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
+
+cmd_build() {
+  need go
+  ( cd "$DIR" && go build -trimpath -o bin/ai-bridge . )
+  echo "built $DIR/bin/ai-bridge"
+}
+
+cmd_install() {
+  mkdir -p "$DIR/logs"
+  cp "$PLIST_SRC" "$PLIST_DST"
+  launchctl bootstrap "$GUI" "$PLIST_DST" 2>/dev/null || true
+  launchctl kickstart -k "$GUI/$LABEL"
+  echo "installed + started launchd service $LABEL"
+}
+
+cmd_uninstall() {
+  launchctl bootout "$GUI/$LABEL" 2>/dev/null || true
+  rm -f "$PLIST_DST"
+  echo "uninstalled launchd service $LABEL"
+}
+
+cmd_restart() { launchctl kickstart -k "$GUI/$LABEL"; echo "restarted $LABEL"; }
+
+cmd_ca_trust() {
+  [ -f "$CA_PEM" ] || die "CA not found at $CA_PEM (run the service once first: ./bridge install)"
+  echo "adding CA to System keychain (admin password required)..."
+  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$CA_PEM"
+  echo "CA trusted"
+}
+
+cmd_ca_untrust() {
+  sudo security delete-certificate -c "ai-bridge CA" /Library/Keychains/System.keychain 2>/dev/null || true
+  echo "CA trust removed"
+}
+
+# _sb_apply <jq-program> [jq-args...]: back up the sing-box config, run the jq
+# transform, validate with `sing-box check`, then atomically swap it in.
+_sb_apply() {
+  local prog="$1"; shift
+  need jq
+  [ -x "$SB_BIN" ] || die "sing-box not found at $SB_BIN"
+  [ -f "$SB_CFG" ] || die "sing-box config not found at $SB_CFG"
+  local ts tmp
+  ts="$(date +%Y%m%dT%H%M%S)"
+  cp "$SB_CFG" "$SB_CFG.bak-ai-bridge-$ts"
+  tmp="$(mktemp)"
+  jq "$@" "$prog" "$SB_CFG" >"$tmp" || { rm -f "$tmp"; die "jq transform failed"; }
+  "$SB_BIN" check -c "$tmp" || { rm -f "$tmp"; die "sing-box check failed; config unchanged (backup: $SB_CFG.bak-ai-bridge-$ts)"; }
+  mv "$tmp" "$SB_CFG"
+  echo "sing-box config updated (backup: $SB_CFG.bak-ai-bridge-$ts). Reload SFM (reconnect the profile) to apply."
+}
+
+cmd_singbox_patch() {
+  _sb_apply '
+    if (.route.rules | any(.override_port? == '"$PORT"')) then .
+    else .route.rules = (.route.rules[0:2] + [$r] + .route.rules[2:]) end
+  ' --argjson r "$REDIRECT_RULE"
+}
+
+cmd_singbox_unpatch() {
+  _sb_apply '.route.rules |= map(select(.override_port? != '"$PORT"'))'
+}
+
+cmd_on()  { cmd_singbox_patch; }
+cmd_off() { cmd_singbox_unpatch; }
+
+cmd_status() {
+  echo "== launchd =="
+  launchctl print "$GUI/$LABEL" 2>/dev/null | awk '/state = /{print; exit}' || echo "  not loaded"
+  echo "== listener :$PORT =="
+  if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then echo "  listening"; else echo "  NOT listening"; fi
+  echo "== sing-box socks :$SOCKS_PORT =="
+  if nc -z 127.0.0.1 "$SOCKS_PORT" >/dev/null 2>&1; then echo "  reachable"; else echo "  NOT reachable (start SFM)"; fi
+  echo "== redirect rule =="
+  if command -v jq >/dev/null 2>&1 && [ -f "$SB_CFG" ] && jq -e '.route.rules | any(.override_port? == '"$PORT"')' "$SB_CFG" >/dev/null 2>&1; then
+    echo "  present (bridge ON)"; else echo "  absent (bridge OFF / direct)"; fi
+  echo "== CA trust =="
+  if security find-certificate -c "ai-bridge CA" /Library/Keychains/System.keychain >/dev/null 2>&1; then echo "  trusted"; else echo "  NOT trusted"; fi
+}
+
+cmd_logs() { tail -f "$DIR/logs/cpa.err.log" "$DIR/logs/cpa.out.log"; }
+
+cmd_smoke() {
+  need curl; need jq
+  [ -f "$CA_PEM" ] || die "CA not found at $CA_PEM"
+  local token="${CODEX_TOKEN:-}"
+  if [ -z "$token" ]; then token="$(jq -r '.tokens.access_token // empty' "$HOME/.codex/auth.json" 2>/dev/null || true)"; fi
+  [ -n "$token" ] || die "no token: set CODEX_TOKEN or ensure ~/.codex/auth.json has .tokens.access_token"
+  echo "sending gpt-5.5 stream through the bridge (chatgpt.com -> 127.0.0.1:$PORT)..."
+  local out
+  out="$(curl -sN --max-time 300 \
+    --resolve "chatgpt.com:$PORT:127.0.0.1" --cacert "$CA_PEM" \
+    "https://chatgpt.com:$PORT/backend-api/codex/responses" \
+    -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+    -H 'User-Agent: codex_cli_rs/0.142.5 (smoke)' \
+    -d '{"model":"gpt-5.5","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Reply with the single word ok"}]}],"reasoning":{"effort":"low"}}' || true)"
+  if grep -q proxy_rounds <<<"$out"; then
+    echo "SMOKE PASS: response.completed carried metadata.proxy_rounds"
+  else
+    echo "SMOKE FAIL: no proxy_rounds seen. Last lines:"; tail -n 5 <<<"$out"
+    return 1
+  fi
+}
+
+cmd_init() {
+  cmd_build
+  cmd_install
+  sleep 1
+  cmd_ca_trust
+  cmd_singbox_patch
+  cmd_status
+  cmd_smoke || echo "(smoke failed — see status above and README troubleshooting)"
+}
+
+usage() {
+  cat <<EOF
+ai-bridge — transparent MITM gateway for codex (fold + audit)
+
+Usage: ./bridge <command>
+
+  init             build + install + trust CA + patch sing-box + status + smoke (one-time)
+  build            go build -> bin/ai-bridge
+  install          copy plist + launchd bootstrap + start (auto-creates CA on first run)
+  uninstall        stop + remove launchd service
+  restart          kickstart the service
+  ca-trust         add local CA to System keychain (sudo)
+  ca-untrust       remove local CA from System keychain (sudo)
+  on               add sing-box redirect rule (codex -> bridge)
+  off              remove sing-box redirect rule (codex -> chatgpt.com direct)
+  singbox-patch    same as 'on' (idempotent, sing-box check + backup)
+  singbox-unpatch  same as 'off'
+  status           show launchd / listener / socks / rule / CA state
+  logs             tail service logs
+  smoke            send a gpt-5.5 stream through the bridge and check for proxy_rounds
+EOF
+}
+
+case "${1:-}" in
+  init) cmd_init ;;
+  build) cmd_build ;;
+  install) cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  restart) cmd_restart ;;
+  ca-trust) cmd_ca_trust ;;
+  ca-untrust) cmd_ca_untrust ;;
+  on) cmd_on ;;
+  off) cmd_off ;;
+  singbox-patch) cmd_singbox_patch ;;
+  singbox-unpatch) cmd_singbox_unpatch ;;
+  status) cmd_status ;;
+  logs) cmd_logs ;;
+  smoke) cmd_smoke ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac
