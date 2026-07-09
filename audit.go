@@ -14,8 +14,9 @@ import (
 )
 
 // auditor writes one directory per day. Each request yields a req-<id>.json
-// (redacted metadata + request body) and, when streamed, a req-<id>.sse with the
-// full downstream response; index.jsonl holds a one-line summary per request.
+// (redacted metadata + optional request body) and, when enabled for the endpoint,
+// a req-<id>.sse or req-<id>.response with the downstream response; index.jsonl
+// holds a one-line summary per request.
 type auditor struct {
 	dir        string
 	recordBody bool
@@ -27,13 +28,13 @@ func newAuditor(dir string, recordBody bool) *auditor {
 }
 
 type auditRecord struct {
-	a       *auditor
-	id      string
-	dayDir  string
-	start   time.Time
-	meta    map[string]any
-	sseFile *os.File
-	sseErr  bool
+	a        *auditor
+	id       string
+	dayDir   string
+	start    time.Time
+	meta     map[string]any
+	respFile *os.File
+	respErr  bool
 }
 
 func (a *auditor) begin(r *http.Request, kind string, body []byte) *auditRecord {
@@ -63,23 +64,33 @@ func (a *auditor) begin(r *http.Request, kind string, body []byte) *auditRecord 
 }
 
 func (rec *auditRecord) sse(p []byte) {
-	if rec == nil || rec.sseErr {
+	rec.response(p, ".sse")
+}
+
+func (rec *auditRecord) response(p []byte, ext string) {
+	if rec == nil || rec.respErr {
 		return
 	}
-	if rec.sseFile == nil {
-		if err := os.MkdirAll(rec.dayDir, 0o755); err != nil {
-			rec.sseErr = true
-			return
-		}
-		f, err := os.Create(filepath.Join(rec.dayDir, "req-"+rec.id+".sse"))
-		if err != nil {
-			rec.sseErr = true
-			logWarn("audit sse create", err)
-			return
-		}
-		rec.sseFile = f
+	if ext == "" {
+		ext = ".response"
 	}
-	_, _ = rec.sseFile.Write(p)
+	if rec.respFile == nil {
+		if err := os.MkdirAll(rec.dayDir, 0o755); err != nil {
+			rec.respErr = true
+			return
+		}
+		name := "req-" + rec.id + ext
+		f, err := os.Create(filepath.Join(rec.dayDir, name))
+		if err != nil {
+			rec.respErr = true
+			logWarn("audit response create", err)
+			return
+		}
+		rec.respFile = f
+		rec.meta["response_log"] = name
+		rec.meta["response_log_kind"] = strings.TrimPrefix(ext, ".")
+	}
+	_, _ = rec.respFile.Write(p)
 }
 
 func (rec *auditRecord) fields(kv map[string]any) {
@@ -95,8 +106,8 @@ func (rec *auditRecord) done() {
 	if rec == nil {
 		return
 	}
-	if rec.sseFile != nil {
-		_ = rec.sseFile.Close()
+	if rec.respFile != nil {
+		_ = rec.respFile.Close()
 	}
 	rec.meta["latency_ms"] = time.Since(rec.start).Milliseconds()
 	if err := os.MkdirAll(rec.dayDir, 0o755); err != nil {
@@ -107,7 +118,7 @@ func (rec *auditRecord) done() {
 		_ = os.WriteFile(filepath.Join(rec.dayDir, "req-"+rec.id+".json"), b, 0o644)
 	}
 	summary := map[string]any{}
-	for _, k := range []string{"ts", "id", "kind", "cli", "method", "path", "model", "stream", "folded", "status", "rounds", "stopped_reason", "latency_ms"} {
+	for _, k := range []string{"ts", "id", "kind", "provider", "endpoint", "cli", "method", "path", "model", "stream", "folded", "status", "rounds", "stopped_reason", "response_log", "latency_ms"} {
 		if v, ok := rec.meta[k]; ok {
 			summary[k] = v
 		}
@@ -141,6 +152,10 @@ func detectCLI(ua string) string {
 		return "codex"
 	case strings.Contains(l, "claude"):
 		return "claude"
+	case strings.Contains(l, "gemini"):
+		return "gemini"
+	case strings.Contains(l, "anthropic"):
+		return "anthropic"
 	default:
 		return "other"
 	}
@@ -152,6 +167,8 @@ var redactedHeaderKeys = map[string]bool{
 	"set-cookie":          true,
 	"proxy-authorization": true,
 	"x-api-key":           true,
+	"anthropic-api-key":   true,
+	"x-goog-api-key":      true,
 }
 
 func redactHeaders(h http.Header) map[string]string {

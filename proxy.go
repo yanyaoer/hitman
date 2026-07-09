@@ -96,14 +96,22 @@ func upstreamURL(r *http.Request) string {
 func (s *server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	_ = r.Body.Close()
-	rec := s.audit.begin(r, "passthrough", nil)
-	defer rec.done()
 	if err != nil {
+		rec := s.audit.begin(r, "passthrough", nil)
+		defer rec.done()
 		http.Error(w, "hitman: read request body: "+err.Error(), http.StatusBadRequest)
 		rec.fields(map[string]any{"status": 400, "error": err.Error()})
 		return
 	}
-	s.forward(w, r, body, rec, false)
+	info := classifyEndpoint(r, body)
+	var auditBody []byte
+	if info.AuditRequestBody {
+		auditBody = body
+	}
+	rec := s.audit.begin(r, info.Kind, auditBody)
+	defer rec.done()
+	rec.fields(info.fields())
+	s.forward(w, r, body, rec, forwardOptions{Endpoint: info, AuditResponse: info.AuditResponse})
 }
 
 func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
@@ -118,9 +126,11 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var parsed map[string]any
+	info := classifyEndpoint(r, body)
+	rec.fields(info.fields())
 	if err := json.Unmarshal(body, &parsed); err != nil || !foldApplies(parsed) {
 		rec.fields(map[string]any{"folded": false})
-		s.forward(w, r, body, rec, true)
+		s.forward(w, r, body, rec, forwardOptions{Endpoint: info, AuditResponse: true})
 		return
 	}
 
@@ -168,11 +178,16 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type forwardOptions struct {
+	Endpoint      endpointInfo
+	AuditResponse bool
+}
+
 // forward is a transparent reverse proxy: decrypt -> re-encrypt to the real
 // upstream via socks -> stream the response back. Used for every non-folded
 // request (token refresh, rate-limit checks, non-gpt-5.5 responses, etc). When
-// audit is true the response stream is teed into the audit .sse file.
-func (s *server) forward(w http.ResponseWriter, r *http.Request, body []byte, rec *auditRecord, audit bool) {
+// enabled, the response stream is teed into the audit response file.
+func (s *server) forward(w http.ResponseWriter, r *http.Request, body []byte, rec *auditRecord, opts forwardOptions) {
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL(r), bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, "hitman: build request: "+err.Error(), http.StatusBadGateway)
@@ -191,24 +206,44 @@ func (s *server) forward(w http.ResponseWriter, r *http.Request, body []byte, re
 	w.WriteHeader(resp.StatusCode)
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
+	respLogExt := opts.Endpoint.responseLogExt(resp.Header.Get("Content-Type"))
+	var captured bytes.Buffer
+	captureTruncated := false
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
+			chunk := buf[:n]
+			if _, werr := w.Write(chunk); werr != nil {
 				break
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
-			if audit {
-				rec.sse(buf[:n])
+			if opts.AuditResponse {
+				rec.response(chunk, respLogExt)
+				if captured.Len()+len(chunk) <= maxResponseAnalyzeBytes {
+					_, _ = captured.Write(chunk)
+				} else {
+					captureTruncated = true
+				}
 			}
 		}
 		if rerr != nil {
 			break
 		}
 	}
-	rec.fields(map[string]any{"status": resp.StatusCode})
+	fields := map[string]any{"status": resp.StatusCode}
+	if opts.AuditResponse {
+		fields["response_bytes_analyzed"] = captured.Len()
+		if captureTruncated {
+			fields["response_analysis_truncated"] = true
+		} else if extracted := extractEndpointResponseFields(opts.Endpoint, captured.Bytes()); len(extracted) > 0 {
+			for k, v := range extracted {
+				fields[k] = v
+			}
+		}
+	}
+	rec.fields(fields)
 }
 
 // foldApplies mirrors cpa-plugin-codexcomp's routeModel gate: only gpt-5.5,

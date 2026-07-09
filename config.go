@@ -49,7 +49,7 @@ func loadConfig() appConfig {
 		SocksAddr:      normalizeSocks(envOr("HITMAN_SOCKS", "127.0.0.1:2333")),
 		CADir:          envOr("HITMAN_CA_DIR", "ca"),
 		AuditDir:       envOr("HITMAN_AUDIT_DIR", "audit"),
-		AllowHosts:     splitCSV(envOr("HITMAN_ALLOW_HOSTS", "chatgpt.com")),
+		AllowHosts:     splitCSV(envOr("HITMAN_ALLOW_HOSTS", defaultAllowHosts)),
 		MarkerText:     envOr("HITMAN_MARKER", defaultMarkerText),
 		TruncationStep: envInt("HITMAN_TRUNCATION_STEP", defaultTruncationStep),
 		MaxTierN:       envInt("HITMAN_MAX_TIER_N", defaultMaxTierN),

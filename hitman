@@ -29,6 +29,7 @@ render_launchd_plist() {
   plist_set_string "$p" ":StandardOutPath" "$LOG_OUT"
   plist_set_string "$p" ":WorkingDirectory" "$DIR"
   plist_set_string "$p" ":EnvironmentVariables:HITMAN_SOCKS" "${HITMAN_SOCKS:-direct}"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_ALLOW_HOSTS" "${HITMAN_ALLOW_HOSTS:-${HITMAN_DOMAINS:-$DEFAULT_HITMAN_DOMAINS}}"
 }
 
 # sing-box integration — supports two deployment modes:
@@ -44,16 +45,42 @@ SB_RELOAD_ENV="${HITMAN_SB_RELOAD:-}"
 SB_LAUNCHD_ENV="${HITMAN_SB_LAUNCHD:-}"
 SFM_CFG="$HOME/Library/Group Containers/287TTNZF8L.io.nekohasekai.sfavt/configs/config_2.json"
 SB_CFG=""                                             # resolved lazily by sb_resolve
+DEFAULT_HITMAN_DOMAINS="chatgpt.com,api.anthropic.com,generativelanguage.googleapis.com,aiplatform.googleapis.com"
+DEFAULT_HITMAN_DOMAIN_SUFFIXES="aiplatform.googleapis.com"
+DEFAULT_HITMAN_PROCESSES="codex,claude,claude.exe,gemini,omp,pi,agy"
+HITMAN_DOMAINS_EFFECTIVE="${HITMAN_DOMAINS-$DEFAULT_HITMAN_DOMAINS}"
+HITMAN_DOMAIN_SUFFIXES_EFFECTIVE="${HITMAN_DOMAIN_SUFFIXES-$DEFAULT_HITMAN_DOMAIN_SUFFIXES}"
+HITMAN_PROCESSES_EFFECTIVE="${HITMAN_PROCESSES-$DEFAULT_HITMAN_PROCESSES}"
 
 # The redirect rule. outbound=DIRECT is REQUIRED: after override_address/port rewrite
 # the destination to 127.0.0.1:PORT, sing-box must dial it locally — without an
 # explicit direct outbound it falls to route.final (a proxy node), which then tries
 # to reach 127.0.0.1:PORT on the remote server and the connection is reset.
 # Idempotency key is override_port == PORT.
-REDIRECT_RULE='{"action":"route","inbound":["'"$TUN_INBOUND"'"],"process_name":["codex"],"domain":["chatgpt.com"],"outbound":"'"$DIRECT_OUTBOUND"'","override_address":"127.0.0.1","override_port":'"$PORT"'}'
 
 die() { echo "hitman: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
+
+json_array_from_csv() {
+  jq -Rn --arg csv "$1" '$csv | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""))'
+}
+
+redirect_rule_json() {
+  local domains suffixes processes
+  domains="$(json_array_from_csv "$HITMAN_DOMAINS_EFFECTIVE")"
+  suffixes="$(json_array_from_csv "$HITMAN_DOMAIN_SUFFIXES_EFFECTIVE")"
+  processes="$(json_array_from_csv "$HITMAN_PROCESSES_EFFECTIVE")"
+  jq -cn \
+    --arg inbound "$TUN_INBOUND" \
+    --arg outbound "$DIRECT_OUTBOUND" \
+    --argjson domains "$domains" \
+    --argjson suffixes "$suffixes" \
+    --argjson processes "$processes" \
+    --argjson port "$PORT" \
+    '{action:"route",inbound:[$inbound],domain:$domains,outbound:$outbound,override_address:"127.0.0.1",override_port:$port}
+     + (if ($suffixes | length) > 0 then {domain_suffix:$suffixes} else {} end)
+     + (if ($processes | length) > 0 then {process_name:$processes} else {} end)'
+}
 
 cmd_build() {
   need go
@@ -80,7 +107,7 @@ cmd_restart() { launchctl kickstart -k "$GUI/$LABEL"; echo "restarted $LABEL"; }
 
 # egress <socks [addr] | direct>: set how hitman reaches the upstream.
 #   socks : dial via sing-box socks-in (default 127.0.0.1:2333) — needs the socks port reachable.
-#   direct: dial chatgpt.com straight and let the sing-box TUN capture it — use when
+#   direct: dial upstream straight and let the sing-box TUN capture it — use when
 #           strict_route blocks the socks inbound. Loop-safe only with process-scoped redirect.
 cmd_egress() {
   local mode="${1:-}" addr="${2:-127.0.0.1:2333}" val
@@ -187,6 +214,9 @@ cmd_singbox_patch() {
   # Remove any prior hitman rule (match on override_port) then insert the current
   # one right after the leading sniff/hijack-dns rules, so re-running `on` upgrades
   # the rule in place and it takes priority over real routing rules (first-match wins).
+  local redirect_rule
+  need jq
+  redirect_rule="$(redirect_rule_json)"
   _sb_apply '
     def leadlen($rules):
       reduce $rules[] as $x ({n:0, stop:false};
@@ -196,7 +226,7 @@ cmd_singbox_patch() {
     (.route.rules | map(select(.override_port? != '"$PORT"'))) as $c
     | leadlen($c) as $at
     | .route.rules = ($c[0:$at] + [$r] + $c[$at:])
-  ' --argjson r "$REDIRECT_RULE"
+  ' --argjson r "$redirect_rule"
 }
 
 cmd_singbox_unpatch() {
@@ -220,8 +250,20 @@ cmd_status() {
   echo "== sing-box config =="
   if sb_resolve; then echo "  mode=$SB_MODE  config=$SB_CFG"; else echo "  NOT found (set HITMAN_SB_CONFIG)"; fi
   echo "== redirect rule =="
-  if command -v jq >/dev/null 2>&1 && [ -n "$SB_CFG" ] && [ -f "$SB_CFG" ] && jq -e '.route.rules | any(.override_port? == '"$PORT"')' "$SB_CFG" >/dev/null 2>&1; then
-    echo "  present (hitman ON)"; else echo "  absent (hitman OFF / direct)"; fi
+  local rule=""
+  if command -v jq >/dev/null 2>&1 && [ -n "$SB_CFG" ] && [ -f "$SB_CFG" ]; then
+    rule="$(jq -c '.route.rules[]? | select(.override_port? == '"$PORT"')' "$SB_CFG" 2>/dev/null | tail -n 1)"
+  fi
+  if [ -n "$rule" ]; then echo "  present (hitman ON)"; else echo "  absent (hitman OFF / direct)"; fi
+  echo "== intercept targets =="
+  echo "  desired domains: $HITMAN_DOMAINS_EFFECTIVE"
+  if [ -n "$HITMAN_DOMAIN_SUFFIXES_EFFECTIVE" ]; then echo "  desired domain_suffixes: $HITMAN_DOMAIN_SUFFIXES_EFFECTIVE"; fi
+  if [ -n "$HITMAN_PROCESSES_EFFECTIVE" ]; then echo "  desired processes: $HITMAN_PROCESSES_EFFECTIVE"; else echo "  desired processes: <host-level>"; fi
+  if [ -n "$rule" ]; then
+    echo "$rule" | jq -r '"  actual domains: " + ((.domain // []) | join(","))'
+    echo "$rule" | jq -r 'if (.domain_suffix? // [] | length) > 0 then "  actual domain_suffixes: " + ((.domain_suffix // []) | join(",")) else "  actual domain_suffixes: <none>" end'
+    echo "$rule" | jq -r 'if (.process_name? // [] | length) > 0 then "  actual processes: " + ((.process_name // []) | join(",")) else "  actual processes: <host-level>" end'
+  fi
   echo "== CA trust =="
   if security find-certificate -c "hitman CA" /Library/Keychains/System.keychain >/dev/null 2>&1; then echo "  trusted"; else echo "  NOT trusted"; fi
 }
@@ -282,8 +324,8 @@ Usage: ./hitman <command>
   egress <mode>    set upstream egress: 'socks [addr]' (default 2333) or 'direct' (via TUN)
   ca-trust         add local CA to System keychain (sudo)
   ca-untrust       remove local CA from System keychain (sudo)
-  on               add sing-box redirect rule (codex -> hitman)
-  off              remove sing-box redirect rule (codex -> chatgpt.com direct)
+  on               add sing-box redirect rule (configured agent processes -> hitman)
+  off              remove sing-box redirect rule
   singbox-patch    same as 'on' (idempotent, sing-box check + backup)
   singbox-unpatch  same as 'off'
   status           show launchd / listener / socks / rule / CA state

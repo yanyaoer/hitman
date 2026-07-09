@@ -34,6 +34,15 @@ func TestDefaultMaxContinueDisablesFold(t *testing.T) {
 	}
 }
 
+func TestDefaultAllowHostsIncludeAnthropicAndGemini(t *testing.T) {
+	cfg := loadConfig()
+	for _, host := range []string{"chatgpt.com", "api.anthropic.com", "generativelanguage.googleapis.com", "aiplatform.googleapis.com"} {
+		if !hostAllowed(cfg.AllowHosts, host) {
+			t.Fatalf("default AllowHosts does not allow %s: %#v", host, cfg.AllowHosts)
+		}
+	}
+}
+
 func TestLoadOrCreateCAUsesHitmanNames(t *testing.T) {
 	dir := t.TempDir()
 	caObj, err := loadOrCreateCA(dir)
