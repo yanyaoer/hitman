@@ -26,7 +26,7 @@ func newServer(cfg appConfig, audit *auditor) *server {
 		ResponseHeaderTimeout: 120 * time.Second,
 		ExpectContinueTimeout: 2 * time.Second,
 	}
-	dialContext, _, err := proxyDialContext(cfg.UpstreamProxy, false)
+	dialContext, _, err := upstreamDialContext(cfg.UpstreamMode, cfg.UpstreamProxy, cfg.UpstreamDNS, fakeIPPrefixesFromEnv())
 	if err != nil {
 		transport.DialContext = func(context.Context, string, string) (net.Conn, error) {
 			return nil, err

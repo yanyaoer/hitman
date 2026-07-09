@@ -4,6 +4,10 @@
 <dict>
 	<key>EnvironmentVariables</key>
 	<dict>
+		<key>HITMAN_DNS_UPSTREAM</key>
+		<string>1.1.1.1:53</string>
+		<key>HITMAN_UPSTREAM_MODE</key>
+		<string>proxy</string>
 		<key>HITMAN_UPSTREAM_PROXY</key>
 		<string>socks5://127.0.0.1:2333</string>
 		<key>HOME</key>

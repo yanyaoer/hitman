@@ -7,10 +7,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/miekg/dns"
 )
 
 func normalizeProxy(v string) string {
@@ -54,6 +57,85 @@ func proxyDialContext(proxyAddr string, requireProxy bool) (func(context.Context
 	default:
 		return nil, "", fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
 	}
+}
+
+func upstreamDialContext(mode, proxyAddr, dnsAddr string, blockedPrefixes []netip.Prefix) (func(context.Context, string, string) (net.Conn, error), string, error) {
+	mode = normalizeUpstreamMode(mode)
+	switch mode {
+	case "proxy":
+		return proxyDialContext(proxyAddr, true)
+	case "system":
+		if _, _, err := net.SplitHostPort(dnsAddr); err != nil {
+			return nil, "", fmt.Errorf("parse upstream DNS: %w", err)
+		}
+		return realIPDialContext(&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}, dnsAddr, blockedPrefixes), "system:" + dnsAddr, nil
+	default:
+		return nil, "", fmt.Errorf("unsupported upstream mode %q", mode)
+	}
+}
+
+func realIPDialContext(baseDialer *net.Dialer, dnsAddr string, blockedPrefixes []netip.Prefix) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		ip, err := resolveRealIP(ctx, dnsAddr, host, blockedPrefixes)
+		if err != nil {
+			return nil, err
+		}
+		return baseDialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+	}
+}
+
+func resolveRealIP(ctx context.Context, dnsAddr, host string, blockedPrefixes []netip.Prefix) (netip.Addr, error) {
+	if addr, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil {
+		if prefixContains(blockedPrefixes, addr) {
+			return netip.Addr{}, fmt.Errorf("resolved address %s is inside blocked fake-IP range", addr)
+		}
+		return addr, nil
+	}
+	host = dns.Fqdn(normalizeDomain(host))
+	for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		msg := new(dns.Msg)
+		msg.SetQuestion(host, qtype)
+		resp, _, err := new(dns.Client).ExchangeContext(ctx, msg, dnsAddr)
+		if err != nil {
+			return netip.Addr{}, err
+		}
+		if resp == nil {
+			continue
+		}
+		for _, rr := range resp.Answer {
+			var addr netip.Addr
+			switch v := rr.(type) {
+			case *dns.A:
+				addr, _ = netip.AddrFromSlice(v.A)
+			case *dns.AAAA:
+				addr, _ = netip.AddrFromSlice(v.AAAA)
+			default:
+				continue
+			}
+			if !addr.IsValid() {
+				continue
+			}
+			if prefixContains(blockedPrefixes, addr) {
+				return netip.Addr{}, fmt.Errorf("resolved address %s is inside blocked fake-IP range", addr)
+			}
+			return addr, nil
+		}
+	}
+	return netip.Addr{}, fmt.Errorf("no A/AAAA record for %s via %s", host, dnsAddr)
+}
+
+func prefixContains(prefixes []netip.Prefix, addr netip.Addr) bool {
+	addr = addr.Unmap()
+	for _, prefix := range prefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // socks5DialContext returns a DialContext that tunnels TCP through a SOCKS5 proxy

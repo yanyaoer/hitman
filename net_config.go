@@ -9,6 +9,7 @@ import (
 )
 
 const (
+	defaultUpstreamMode      = "proxy"
 	defaultNetDNSAddr        = "127.0.0.1:8472"
 	defaultNetMITMAddr       = "127.0.0.1:8471"
 	defaultFakeIPCIDR        = "198.18.0.0/15"
@@ -23,6 +24,7 @@ const (
 type netConfig struct {
 	DNSAddr         string
 	MITMAddr        string
+	UpstreamMode    string
 	UpstreamProxy   string
 	UpstreamDNS     string
 	FakeIPCIDR      netip.Prefix
@@ -50,13 +52,12 @@ func loadNetConfig() (netConfig, error) {
 	if !tunAddress.Addr().Is4() {
 		return netConfig{}, fmt.Errorf("HITMAN_TUN_ADDRESS must be IPv4")
 	}
+	mode := normalizeUpstreamMode(envOr("HITMAN_UPSTREAM_MODE", defaultUpstreamMode))
 	proxy := normalizeProxy(envOr("HITMAN_UPSTREAM_PROXY", envOr("HITMAN_SOCKS", "127.0.0.1:2333")))
-	if proxy == "" {
-		return netConfig{}, fmt.Errorf("HITMAN_UPSTREAM_PROXY is required for netd; direct egress would bypass sing-box and can loop")
-	}
 	c := netConfig{
 		DNSAddr:         envOr("HITMAN_NETD_DNS", defaultNetDNSAddr),
 		MITMAddr:        envOr("HITMAN_MITM_ADDR", defaultNetMITMAddr),
+		UpstreamMode:    mode,
 		UpstreamProxy:   proxy,
 		UpstreamDNS:     envOr("HITMAN_DNS_UPSTREAM", defaultUpstreamDNS),
 		FakeIPCIDR:      fakeCIDR.Masked(),
@@ -77,10 +78,32 @@ func loadNetConfig() (netConfig, error) {
 	if _, _, err := net.SplitHostPort(c.UpstreamDNS); err != nil {
 		return netConfig{}, fmt.Errorf("parse HITMAN_DNS_UPSTREAM: %w", err)
 	}
+	if c.UpstreamMode == "proxy" && c.UpstreamProxy == "" {
+		return netConfig{}, fmt.Errorf("HITMAN_UPSTREAM_PROXY is required when HITMAN_UPSTREAM_MODE=proxy")
+	}
 	if len(c.Domains) == 0 && len(c.DomainSuffixes) == 0 {
 		return netConfig{}, fmt.Errorf("at least one HITMAN_DOMAINS or HITMAN_DOMAIN_SUFFIXES entry is required")
 	}
 	return c, nil
+}
+
+func normalizeUpstreamMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "proxy":
+		return "proxy"
+	case "system", "direct":
+		return "system"
+	default:
+		return strings.ToLower(strings.TrimSpace(mode))
+	}
+}
+
+func fakeIPPrefixesFromEnv() []netip.Prefix {
+	prefix, err := netip.ParsePrefix(envOr("HITMAN_FAKEIP_CIDR", defaultFakeIPCIDR))
+	if err != nil || !prefix.Addr().IsValid() {
+		return nil
+	}
+	return []netip.Prefix{prefix.Masked()}
 }
 
 type targetMatcher struct {

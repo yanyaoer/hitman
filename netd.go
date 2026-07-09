@@ -56,7 +56,7 @@ func runNetd() {
 		_ = daemon.Close()
 		log.Fatalf("fatal: netd start: %v", err)
 	}
-	log.Printf("netd ready (dns %s, fake %s, proxy %s, mitm %s)", cfg.DNSAddr, cfg.FakeIPCIDR, daemon.upstreamLabel, cfg.MITMAddr)
+	log.Printf("netd ready (dns %s, fake %s, upstream %s, mitm %s)", cfg.DNSAddr, cfg.FakeIPCIDR, daemon.upstreamLabel, cfg.MITMAddr)
 	<-ctx.Done()
 	log.Printf("netd shutting down")
 	_ = daemon.Close()
@@ -67,7 +67,7 @@ func newNetDaemon(cfg netConfig) (*netDaemon, error) {
 	if err != nil {
 		return nil, err
 	}
-	upstreamDial, upstreamLabel, err := proxyDialContext(cfg.UpstreamProxy, true)
+	upstreamDial, upstreamLabel, err := upstreamDialContext(cfg.UpstreamMode, cfg.UpstreamProxy, cfg.UpstreamDNS, []netip.Prefix{cfg.FakeIPCIDR})
 	if err != nil {
 		return nil, err
 	}

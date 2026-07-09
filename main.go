@@ -61,7 +61,7 @@ func runServe() {
 	if err != nil {
 		log.Fatalf("fatal: listen %s: %v", cfg.ListenAddr, err)
 	}
-	log.Printf("listening on https://%s (egress %s, audit %s, ca %s)", cfg.ListenAddr, upstreamLabel(cfg.UpstreamProxy), cfg.AuditDir, cfg.CADir)
+	log.Printf("listening on https://%s (egress %s, audit %s, ca %s)", cfg.ListenAddr, upstreamLabel(cfg), cfg.AuditDir, cfg.CADir)
 
 	go func() {
 		if err := httpServer.ServeTLS(ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -78,8 +78,8 @@ func runServe() {
 	_ = httpServer.Shutdown(ctx)
 }
 
-func upstreamLabel(proxyAddr string) string {
-	_, label, err := proxyDialContext(proxyAddr, false)
+func upstreamLabel(cfg appConfig) string {
+	_, label, err := upstreamDialContext(cfg.UpstreamMode, cfg.UpstreamProxy, cfg.UpstreamDNS, fakeIPPrefixesFromEnv())
 	if err != nil {
 		return "invalid (" + err.Error() + ")"
 	}

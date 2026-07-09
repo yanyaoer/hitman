@@ -21,7 +21,9 @@ const (
 // script can tune behaviour without touching code.
 type appConfig struct {
 	ListenAddr    string   // TLS listener agent traffic is redirected to
+	UpstreamMode  string   // proxy or system
 	UpstreamProxy string   // sing-box socks/mixed inbound used for real egress
+	UpstreamDNS   string   // resolver used by system upstream mode
 	SocksAddr     string   // deprecated alias for old tests/scripts
 	CADir         string   // holds hitman-ca.pem / .key
 	AuditDir      string   // per-day audit output
@@ -48,7 +50,9 @@ func loadConfig() appConfig {
 	upstreamProxy := normalizeProxy(envOr("HITMAN_UPSTREAM_PROXY", envOr("HITMAN_SOCKS", "127.0.0.1:2333")))
 	c := appConfig{
 		ListenAddr:     envOr("HITMAN_LISTEN", "127.0.0.1:8471"),
+		UpstreamMode:   normalizeUpstreamMode(envOr("HITMAN_UPSTREAM_MODE", defaultUpstreamMode)),
 		UpstreamProxy:  upstreamProxy,
+		UpstreamDNS:    envOr("HITMAN_DNS_UPSTREAM", defaultUpstreamDNS),
 		SocksAddr:      upstreamProxy,
 		CADir:          envOr("HITMAN_CA_DIR", "ca"),
 		AuditDir:       envOr("HITMAN_AUDIT_DIR", "audit"),

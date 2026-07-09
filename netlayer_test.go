@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/miekg/dns"
 )
 
 func TestFakeIPStoreStableReverseMapping(t *testing.T) {
@@ -121,4 +123,89 @@ func TestHTTPConnectDialer(t *testing.T) {
 	if got := <-done; got != "ok" {
 		t.Fatalf("proxy server got %q", got)
 	}
+}
+
+func TestSystemDialerResolvesRealIP(t *testing.T) {
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcpLn.Close()
+	_, port, err := net.SplitHostPort(tcpLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, err := tcpLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		accepted <- struct{}{}
+	}()
+
+	dnsAddr, closeDNS := startTestDNSServer(t, map[string]string{"example.test.": "127.0.0.1"})
+	defer closeDNS()
+	dial, label, err := upstreamDialContext("system", "", dnsAddr, []netip.Prefix{netip.MustParsePrefix("198.18.0.0/15")})
+	if err != nil {
+		t.Fatalf("upstreamDialContext: %v", err)
+	}
+	if label != "system:"+dnsAddr {
+		t.Fatalf("label = %q", label)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	conn, err := dial(ctx, "tcp", net.JoinHostPort("example.test", port))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = conn.Close()
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatalf("server did not accept resolved real-IP connection")
+	}
+}
+
+func TestSystemDialerRejectsFakeIP(t *testing.T) {
+	dnsAddr, closeDNS := startTestDNSServer(t, map[string]string{"loop.test.": "198.18.0.8"})
+	defer closeDNS()
+	dial, _, err := upstreamDialContext("system", "", dnsAddr, []netip.Prefix{netip.MustParsePrefix("198.18.0.0/15")})
+	if err != nil {
+		t.Fatalf("upstreamDialContext: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = dial(ctx, "tcp", "loop.test:443")
+	if err == nil || !strings.Contains(err.Error(), "blocked fake-IP") {
+		t.Fatalf("err = %v, want blocked fake-IP rejection", err)
+	}
+}
+
+func startTestDNSServer(t *testing.T, records map[string]string) (string, func()) {
+	t.Helper()
+	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := dns.NewServeMux()
+	mux.HandleFunc(".", func(w dns.ResponseWriter, req *dns.Msg) {
+		resp := new(dns.Msg)
+		resp.SetReply(req)
+		for _, q := range req.Question {
+			ipString, ok := records[q.Name]
+			if !ok || q.Qtype != dns.TypeA {
+				continue
+			}
+			resp.Answer = append(resp.Answer, &dns.A{
+				Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 1},
+				A:   net.ParseIP(ipString).To4(),
+			})
+		}
+		_ = w.WriteMsg(resp)
+	})
+	server := &dns.Server{PacketConn: packetConn, Handler: mux}
+	go func() { _ = server.ActivateAndServe() }()
+	return packetConn.LocalAddr().String(), func() { _ = server.Shutdown() }
 }
