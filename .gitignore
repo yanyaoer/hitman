@@ -1,5 +1,6 @@
 # build artifacts
 /bin/
+/dist/
 /ai-bridge
 *.exe
 

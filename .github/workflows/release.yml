@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Build archives
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          fi
+
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-s -w -X hitman/internal/hitman.version=${tag} -X hitman/internal/hitman.commit=${GITHUB_SHA} -X hitman/internal/hitman.date=${build_date}"
+
+          rm -rf dist
+          mkdir -p dist
+
+          for target in darwin/amd64 darwin/arm64; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            stage="dist/stage-${goos}-${goarch}"
+            mkdir -p "${stage}"
+
+            GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 \
+              go build -tags with_gvisor -trimpath -ldflags "${ldflags}" \
+              -o "${stage}/hitman" ./cmd/hitman
+
+            cp README.md NOTICE "${stage}/"
+            tar -C "${stage}" -czf "dist/hitman_${goos}_${goarch}.tar.gz" hitman README.md NOTICE
+          done
+
+          (
+            cd dist
+            shasum -a 256 hitman_*.tar.gz > checksums.txt
+          )
+
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.build.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          notes="Install with the archive matching your macOS architecture, then run:
+
+          hitman init
+
+          Update an existing install with:
+
+          hitman update"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/hitman_*.tar.gz dist/checksums.txt --clobber
+          else
+            gh release create "${TAG}" dist/hitman_*.tar.gz dist/checksums.txt \
+              --target "${GITHUB_SHA}" \
+              --title "${TAG}" \
+              --notes "${notes}"
+          fi

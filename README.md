@@ -61,51 +61,73 @@ service owns prompt data and audit files.
 ## Requirements
 
 - macOS.
-- Go 1.26.
 - One upstream mode:
   - `system`: no proxy; hitman resolves the real upstream IP with `upstreamDNS` and lets macOS route the connection.
   - `proxy`: a reachable SOCKS5 or HTTP CONNECT proxy, such as sing-box or mihomo.
-- `curl`, `jq`, `launchctl`, and `/usr/libexec/PlistBuddy`.
+- `curl`, `launchctl`, and `security`.
+- Go 1.26 only for development builds from source.
 
 No SFM profile rewrite is required. If SFM, sing-box, or mihomo already exposes
 a reachable socks/mixed/http inbound, hitman can use it as-is.
 
 ## Install
 
+Download the archive for your macOS architecture from the latest GitHub release,
+then install the single binary somewhere on `PATH`:
+
 ```bash
-./hitman init
+arch="$(uname -m)"
+[ "$arch" = "x86_64" ] && arch="amd64"
+curl -L "https://github.com/yanyaoer/hitman/releases/latest/download/hitman_darwin_${arch}.tar.gz" -o /tmp/hitman.tar.gz
+tar -xzf /tmp/hitman.tar.gz -C /tmp hitman
+sudo install -m 755 /tmp/hitman /usr/local/bin/hitman
+```
+
+Initialize launchd services and the local CA:
+
+```bash
+hitman init
 ```
 
 `init` runs:
 
-1. `build`: compiles `bin/hitman` with `-tags with_gvisor`.
-2. `install`: installs and starts both launchd services.
-3. `ca-trust`: trusts `ca/hitman-ca.pem` in the System keychain.
-4. `status`.
-5. `smoke`: live DNS/TUN/netd smoke using a temporary process named `codex`.
+1. `install`: writes launchd plists, copies the root daemon binary to a root-owned system path, and starts both services.
+2. `ca-trust`: trusts the generated CA in the System keychain.
+3. `status`.
+4. `smoke`: live DNS/TUN/netd smoke using a temporary curl copy named `codex`.
 
 The CA is created on first MITM startup. If `ca-trust` says the CA is missing,
-run `./hitman install`, wait a second, then run `./hitman ca-trust`.
+run `hitman install`, wait a second, then run `hitman ca-trust`.
+
+Update the installed binary from GitHub release assets:
+
+```bash
+hitman update
+hitman restart
+```
+
+`hitman restart` also refreshes the root daemon binary copy used by
+`com.hitman.net`.
 
 ## Daily Commands
 
 ```bash
-./hitman on              # build + start MITM plus root netd capture
-./hitman off             # stop netd and remove hitman-managed resolver files
-./hitman status          # services, listeners, proxy, fake route, resolvers, CA
-./hitman logs            # tail MITM and netd logs
-./hitman smoke           # live end-to-end DNS/TUN/netd smoke
-./hitman smoke-mitm      # MITM-only smoke with curl --connect-to
+hitman on              # start MITM plus root netd capture
+hitman off             # stop netd and remove hitman-managed resolver files
+hitman status          # services, listeners, proxy, fake route, resolvers, CA
+hitman logs            # tail MITM and netd logs
+hitman smoke           # live end-to-end DNS/TUN/netd smoke
+hitman smoke-mitm      # MITM-only smoke with curl --connect-to
 ```
 
 Set the upstream mode:
 
 ```bash
-./hitman upstream system           # default: real-IP dial, then system route
-./hitman upstream socks            # socks5://127.0.0.1:2333
-./hitman upstream socks 127.0.0.1:1080
-./hitman upstream http             # http://127.0.0.1:2334
-./hitman upstream http 127.0.0.1:7890
+hitman upstream system           # default: real-IP dial, then system route
+hitman upstream socks            # socks5://127.0.0.1:2333
+hitman upstream socks 127.0.0.1:1080
+hitman upstream http             # http://127.0.0.1:2334
+hitman upstream http 127.0.0.1:7890
 ```
 
 In `proxy` mode, the order is explicit:
@@ -120,16 +142,16 @@ In `system` mode, hitman does not use macOS resolver for upstream hosts. It asks
 hop. This avoids the hitman fake-DNS loop while allowing the system VPN/TUN route
 to carry the connection if one is active.
 
-`./hitman on` is the SFM-free capture switch. It builds the with-gVisor binary,
-starts the user MITM LaunchAgent, starts the root `netd` LaunchDaemon, installs
-hitman-managed `/etc/resolver/*` files, opens fake DNS on `127.0.0.1:8472`, and
-adds the `198.18.0.0/15` fake-IP route through the hitman utun interface. It does
-not edit SFM, sing-box, or mihomo config.
+`hitman on` is the SFM-free capture switch. It starts the user MITM LaunchAgent,
+starts the root `netd` LaunchDaemon, installs hitman-managed `/etc/resolver/*`
+files, opens fake DNS on `127.0.0.1:8472`, and adds the `198.18.0.0/15` fake-IP
+route through the hitman utun interface. It does not edit SFM, sing-box, or
+mihomo config.
 
 ## Audit Layout
 
 ```
-audit/<date>/
+~/Library/Application Support/hitman/audit/<date>/
   req-<id>.json       # metadata + redacted request headers + optional request body
   req-<id>.sse        # streamed response log
   req-<id>.response   # non-SSE response body
@@ -164,13 +186,37 @@ $HOME/.config/hitman/config.json
 
 If the file is missing, hitman uses built-in defaults. The default upstream mode
 is `system`, so a fresh install does not require any proxy IP:port. Running
-`./hitman upstream socks ...` or `./hitman upstream http ...` writes
+`hitman upstream socks ...` or `hitman upstream http ...` writes
 `upstreamMode=proxy` plus `upstreamProxy` into this file; running
-`./hitman upstream system` removes `upstreamProxy`.
+`hitman upstream system` removes `upstreamProxy`.
 
 The launchd plists are intentionally kept to process launch metadata only:
 binary path, working directory, logs, `HOME`, and `PATH`. They do not store
 runtime routing or capture config.
+
+The root LaunchDaemon does not execute a user-writable binary path. During
+`install`, `on`, and `restart`, hitman copies the current executable to:
+
+```text
+/Library/Application Support/hitman/bin/hitman
+```
+
+That copy is installed as `root:wheel` with mode `0755`, and
+`com.hitman.net` points at it. The user LaunchAgent continues to point at the
+binary you run from `PATH`.
+
+Runtime state defaults to:
+
+```text
+~/Library/Application Support/hitman
+```
+
+Relative `caDir` and `auditDir` values are resolved under that state directory.
+Logs default to:
+
+```text
+~/Library/Logs/hitman
+```
 
 Example:
 
@@ -197,17 +243,17 @@ Proxy example:
 | `upstreamMode` | `system` | MITM + netd | `system` or `proxy`; `direct` is accepted as an alias for `system` |
 | `upstreamProxy` | empty | MITM + netd | SOCKS5 or HTTP CONNECT proxy address in `proxy` mode; if set without `upstreamMode`, mode is inferred as `proxy` |
 | `upstreamDNS` | `1.1.1.1:53` | MITM + netd | DNS upstream for non-target resolver-zone names and real-IP resolution in `system` mode |
-| `caDir` | `ca` | MITM + script | local CA directory |
+| `caDir` | `ca` under state dir | MITM + CLI | local CA directory |
 | `auditDir` | `audit` | MITM | per-day audit output directory |
 | `allowHosts` | target hosts | MITM | defense-in-depth upstream Host allowlist |
-| `netDNS` | `127.0.0.1:8472` | netd + script | fake DNS listener |
+| `netDNS` | `127.0.0.1:8472` | netd + CLI | fake DNS listener |
 | `mitmAddr` | `127.0.0.1:8471` | netd | MITM listener that matching flows are piped into |
 | `fakeIPCIDR` | `198.18.0.0/15` | MITM + netd | fake-IP pool, TUN route, and system-mode loop guard |
 | `tunAddress` | `172.31.255.1/30` | netd | utun interface address |
 | `tunName` | empty | netd | optional utun name hint |
 | `domains` | `chatgpt.com,api.anthropic.com,generativelanguage.googleapis.com,aiplatform.googleapis.com` | netd | exact fake-DNS targets |
 | `domainSuffixes` | `aiplatform.googleapis.com` | netd | suffix fake-DNS targets; matches Vertex region hosts |
-| `resolverDomains` | `chatgpt.com,anthropic.com,googleapis.com` | netd + script | `/etc/resolver/<domain>` files to manage |
+| `resolverDomains` | `chatgpt.com,anthropic.com,googleapis.com` | netd + CLI | `/etc/resolver/<domain>` files to manage |
 | `processes` | `codex,claude,claude.exe,gemini,omp,pi,agy` | netd | process basenames allowed into MITM |
 | `processPaths` | empty | netd | exact process paths allowed into MITM |
 | `markerText` | `Continue thinking...` | MITM | Codex folding marker |
@@ -218,11 +264,19 @@ Proxy example:
 | `auditBodies` | `true` | MITM | write request bodies |
 
 `HITMAN_*` environment variables are still accepted as transient overrides for
-development and one-off launches, but the control script no longer writes them
-into launchd plists. The legacy `HITMAN_SOCKS` variable is still accepted as a
-fallback for `upstreamProxy`.
+development and one-off launches, but the CLI does not write them into launchd
+plists. The legacy `HITMAN_SOCKS` variable is still accepted as a fallback for
+`upstreamProxy`.
 
 ## Files Owned By hitman
+
+```text
+~/Library/Application Support/hitman/
+~/Library/Logs/hitman/
+~/Library/LaunchAgents/com.hitman.srv.plist
+/Library/Application Support/hitman/bin/hitman
+/Library/LaunchDaemons/com.hitman.net.plist
+```
 
 `netd` writes resolver files only when the file is missing or already contains
 the marker `# hitman managed resolver`:
@@ -233,7 +287,7 @@ the marker `# hitman managed resolver`:
 /etc/resolver/googleapis.com
 ```
 
-`./hitman off` and daemon shutdown remove only files containing that marker.
+`hitman off` and daemon shutdown remove only files containing that marker.
 Existing resolver files without the marker are left untouched and cause startup
 to fail instead of being overwritten.
 
@@ -241,33 +295,49 @@ to fail instead of being overwritten.
 
 | Symptom | Check |
 |---|---|
-| No Anthropic/Gemini audit lines | `./hitman status`; confirm netd is loaded, DNS `:8472` is listening, resolver files exist, and process name is in `processes`. |
-| Agent reports certificate error | Run `./hitman ca-trust`, or pass `NODE_EXTRA_CA_CERTS=$PWD/ca/hitman-ca.pem` for Node-based CLIs. |
-| `netd` keeps restarting | `./hitman logs`; common causes are missing `with_gvisor` build, existing non-hitman `/etc/resolver/*` files, or unreachable privileges. |
-| Upstream calls fail after MITM | `./hitman status`; in `proxy` mode confirm `upstreamProxy` points at a reachable socks/http proxy; in `system` mode confirm `upstreamDNS` can resolve real upstream IPs and system routing is available. |
+| No Anthropic/Gemini audit lines | `hitman status`; confirm netd is loaded, DNS `:8472` is listening, resolver files exist, and process name is in `processes`. |
+| Agent reports certificate error | Run `hitman ca-trust`, or pass `NODE_EXTRA_CA_CERTS="$HOME/Library/Application Support/hitman/ca/hitman-ca.pem"` for Node-based CLIs. |
+| `netd` keeps restarting | `hitman logs`; common causes are existing non-hitman `/etc/resolver/*` files or unreachable privileges. |
+| Upstream calls fail after MITM | `hitman status`; in `proxy` mode confirm `upstreamProxy` points at a reachable socks/http proxy; in `system` mode confirm `upstreamDNS` can resolve real upstream IPs and system routing is available. |
 | Some googleapis domains break | Non-target names under `googleapis.com` are forwarded to `upstreamDNS`; set that to a DNS server reachable on your network. |
-| Want to disable capture immediately | `./hitman off`; this stops netd and removes hitman-managed resolver files. The MITM service can stay running harmlessly. |
+| Want to disable capture immediately | `hitman off`; this stops netd and removes hitman-managed resolver files. The MITM service can stay running harmlessly. |
 
 ## Development
 
 ```bash
 go test -count=1 ./...
-go build -tags with_gvisor -trimpath -o bin/hitman .
-bash -n hitman
+go build -tags with_gvisor -trimpath -o bin/hitman ./cmd/hitman
+bin/hitman version
 ```
 
 The normal `go test` path does not start TUN or touch `/etc/resolver`. Live
 network smoke requires the installed services:
 
 ```bash
-./hitman on
-./hitman smoke
+bin/hitman on
+bin/hitman smoke
 ```
 
-`smoke` compiles a temporary client whose process basename is `codex`, sends a
-request through normal system DNS, and passes when the DNS/TUN/netd/MITM path
+`smoke` copies `curl` to a temporary executable whose process basename is
+`codex`, sends a request through normal system DNS, and passes when the DNS/TUN/netd/MITM path
 returns an HTTP response. The upstream status code is printed because the check
 is for network interception, not model generation.
+
+## Release
+
+Create a tag to publish a release:
+
+```bash
+git tag v0.0.1
+git push origin v0.0.1
+```
+
+The GitHub workflow runs tests, builds `hitman_darwin_amd64.tar.gz` and
+`hitman_darwin_arm64.tar.gz`, publishes `checksums.txt`, and `hitman update`
+uses those release assets for verified in-place updates.
+
+For private releases, set `GITHUB_TOKEN`; the updater downloads assets through
+the GitHub release asset API with `Accept: application/octet-stream`.
 
 ## Credits
 
