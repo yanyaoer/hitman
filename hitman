@@ -4,8 +4,8 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LABEL="com.miclaw.hitman"
-NET_LABEL="com.miclaw.hitman.net"
+LABEL="com.hitman.srv"
+NET_LABEL="com.hitman.net"
 PORT=8471
 DNS_PORT=8472
 PLIST_SRC="$DIR/$LABEL.plist"

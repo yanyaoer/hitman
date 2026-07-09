@@ -12,7 +12,7 @@
 	<key>KeepAlive</key>
 	<true/>
 	<key>Label</key>
-	<string>com.miclaw.hitman.net</string>
+	<string>com.hitman.net</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/Users/yanyao/Projects/side/hitman/bin/hitman</string>

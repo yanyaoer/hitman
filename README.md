@@ -52,8 +52,8 @@ Two launchd services are installed:
 
 | Service | Scope | Purpose |
 |---|---:|---|
-| `com.miclaw.hitman` | user LaunchAgent | MITM HTTPS server on `127.0.0.1:8471`, audit writer, CA issuer |
-| `com.miclaw.hitman.net` | root LaunchDaemon | fake DNS on `127.0.0.1:8472`, utun, fake-IP route, `/etc/resolver` files |
+| `com.hitman.srv` | user LaunchAgent | MITM HTTPS server on `127.0.0.1:8471`, audit writer, CA issuer |
+| `com.hitman.net` | root LaunchDaemon | fake DNS on `127.0.0.1:8472`, utun, fake-IP route, `/etc/resolver` files |
 
 The root daemon is intentionally narrow: it owns network plumbing. The user
 service owns prompt data and audit files.
