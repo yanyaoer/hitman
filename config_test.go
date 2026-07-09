@@ -6,13 +6,24 @@ import (
 	"testing"
 )
 
+func useTempConfig(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("HITMAN_CONFIG", path)
+	return path
+}
+
 func TestLoadConfigReadsHitmanEnv(t *testing.T) {
+	useTempConfig(t)
 	t.Setenv("HITMAN_LISTEN", "127.0.0.1:2222")
 	t.Setenv("HITMAN_SOCKS", "direct")
 	t.Setenv("HITMAN_MAX_CONTINUE", "2")
 	t.Setenv("HITMAN_AUDIT_BODIES", "false")
 
-	cfg := loadConfig()
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cfg.ListenAddr != "127.0.0.1:2222" {
 		t.Fatalf("ListenAddr = %q, want HITMAN_LISTEN", cfg.ListenAddr)
 	}
@@ -28,14 +39,59 @@ func TestLoadConfigReadsHitmanEnv(t *testing.T) {
 }
 
 func TestDefaultMaxContinueDisablesFold(t *testing.T) {
-	cfg := loadConfig()
+	useTempConfig(t)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cfg.MaxContinue != 0 {
 		t.Fatalf("default MaxContinue = %d, want 0 (folding off by default)", cfg.MaxContinue)
 	}
 }
 
+func TestDefaultUpstreamModeIsSystem(t *testing.T) {
+	useTempConfig(t)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UpstreamMode != "system" {
+		t.Fatalf("default UpstreamMode = %q, want system", cfg.UpstreamMode)
+	}
+	if cfg.UpstreamProxy != "" {
+		t.Fatalf("default UpstreamProxy = %q, want empty", cfg.UpstreamProxy)
+	}
+}
+
+func TestLoadConfigReadsJSONProxy(t *testing.T) {
+	path := useTempConfig(t)
+	if err := os.WriteFile(path, []byte(`{"upstreamProxy":"socks5://127.0.0.1:1080","upstreamDNS":"9.9.9.9:53","maxContinue":3}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UpstreamMode != "proxy" {
+		t.Fatalf("UpstreamMode = %q, want proxy inferred from upstreamProxy", cfg.UpstreamMode)
+	}
+	if cfg.UpstreamProxy != "socks5://127.0.0.1:1080" {
+		t.Fatalf("UpstreamProxy = %q", cfg.UpstreamProxy)
+	}
+	if cfg.UpstreamDNS != "9.9.9.9:53" {
+		t.Fatalf("UpstreamDNS = %q", cfg.UpstreamDNS)
+	}
+	if cfg.MaxContinue != 3 {
+		t.Fatalf("MaxContinue = %d", cfg.MaxContinue)
+	}
+}
+
 func TestDefaultAllowHostsIncludeAnthropicAndGemini(t *testing.T) {
-	cfg := loadConfig()
+	useTempConfig(t)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, host := range []string{"chatgpt.com", "api.anthropic.com", "generativelanguage.googleapis.com", "aiplatform.googleapis.com"} {
 		if !hostAllowed(cfg.AllowHosts, host) {
 			t.Fatalf("default AllowHosts does not allow %s: %#v", host, cfg.AllowHosts)

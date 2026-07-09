@@ -31,14 +31,14 @@ hitman netd DNS
 hitman netd utun + gVisor TCP stack
   │  process_name match? codex/claude/gemini/omp/pi/agy
   ├─ yes: raw TCP pipe to hitman MITM at 127.0.0.1:8471
-  └─ no:  raw TCP pass-through to the real host via sing-box proxy
+  └─ no:  raw TCP pass-through via the configured upstream mode
   ▼
 hitman MITM
   │  local CA signs SNI cert, audits request/response, optionally folds Codex
   ▼
 upstream mode
   ├─ proxy:  socks5/http CONNECT ip:port, e.g. sing-box or mihomo
-  └─ system: resolve real IP with HITMAN_DNS_UPSTREAM, then let macOS route it
+  └─ system: resolve real IP with upstreamDNS, then let macOS route it
   ▼
 upstream model API
 ```
@@ -63,8 +63,8 @@ service owns prompt data and audit files.
 - macOS.
 - Go 1.26.
 - One upstream mode:
+  - `system`: no proxy; hitman resolves the real upstream IP with `upstreamDNS` and lets macOS route the connection.
   - `proxy`: a reachable SOCKS5 or HTTP CONNECT proxy, such as sing-box or mihomo.
-  - `system`: no proxy; hitman resolves the real upstream IP with `HITMAN_DNS_UPSTREAM` and lets macOS route the connection.
 - `curl`, `jq`, `launchctl`, and `/usr/libexec/PlistBuddy`.
 
 No SFM profile rewrite is required. If SFM, sing-box, or mihomo already exposes
@@ -101,11 +101,11 @@ run `./hitman install`, wait a second, then run `./hitman ca-trust`.
 Set the upstream mode:
 
 ```bash
+./hitman upstream system           # default: real-IP dial, then system route
 ./hitman upstream socks            # socks5://127.0.0.1:2333
 ./hitman upstream socks 127.0.0.1:1080
 ./hitman upstream http             # http://127.0.0.1:2334
 ./hitman upstream http 127.0.0.1:7890
-./hitman upstream system           # real-IP dial, then system route
 ```
 
 In `proxy` mode, the order is explicit:
@@ -115,8 +115,8 @@ agent-cli -> hitman netd -> hitman MITM -> socks/http proxy -> upstream
 ```
 
 In `system` mode, hitman does not use macOS resolver for upstream hosts. It asks
-`HITMAN_DNS_UPSTREAM` for a real A/AAAA record, rejects fake-IP answers inside
-`HITMAN_FAKEIP_CIDR`, dials the real IP, and then macOS routing decides the next
+`upstreamDNS` for a real A/AAAA record, rejects fake-IP answers inside
+`fakeIPCIDR`, dials the real IP, and then macOS routing decides the next
 hop. This avoids the hitman fake-DNS loop while allowing the system VPN/TUN route
 to carry the connection if one is active.
 
@@ -140,8 +140,10 @@ Sensitive headers such as `Authorization`, `Cookie`, `X-Api-Key`,
 `Anthropic-Api-Key`, and `X-Goog-Api-Key` are redacted. Request bodies are kept
 by default for local audit; disable with:
 
-```bash
-HITMAN_AUDIT_BODIES=false ./hitman install
+```json
+{
+  "auditBodies": false
+}
 ```
 
 ## Endpoint Logging
@@ -154,29 +156,71 @@ HITMAN_AUDIT_BODIES=false ./hitman install
 
 ## Configuration
 
-All settings are environment variables rendered into the launchd plists by the
-control script.
+Runtime configuration is read from:
 
-| Variable | Default | Used By | Meaning |
+```text
+$HOME/.config/hitman/config.json
+```
+
+If the file is missing, hitman uses built-in defaults. The default upstream mode
+is `system`, so a fresh install does not require any proxy IP:port. Running
+`./hitman upstream socks ...` or `./hitman upstream http ...` writes
+`upstreamMode=proxy` plus `upstreamProxy` into this file; running
+`./hitman upstream system` removes `upstreamProxy`.
+
+The launchd plists are intentionally kept to process launch metadata only:
+binary path, working directory, logs, `HOME`, and `PATH`. They do not store
+runtime routing or capture config.
+
+Example:
+
+```json
+{
+  "upstreamMode": "system",
+  "upstreamDNS": "1.1.1.1:53",
+  "processes": ["codex", "claude", "claude.exe", "gemini", "omp", "pi", "agy"]
+}
+```
+
+Proxy example:
+
+```json
+{
+  "upstreamMode": "proxy",
+  "upstreamProxy": "socks5://127.0.0.1:2333"
+}
+```
+
+| JSON key | Default | Used By | Meaning |
 |---|---|---|---|
-| `HITMAN_LISTEN` | `127.0.0.1:8471` | MITM | HTTPS MITM listener |
-| `HITMAN_UPSTREAM_MODE` | `proxy` | MITM + netd | `proxy` or `system`; `direct` is accepted as an alias for `system` |
-| `HITMAN_UPSTREAM_PROXY` | `socks5://127.0.0.1:2333` | MITM + netd | SOCKS5 or HTTP CONNECT proxy address in `proxy` mode |
-| `HITMAN_ALLOW_HOSTS` | target hosts | MITM | defense-in-depth upstream Host allowlist |
-| `HITMAN_NETD_DNS` | `127.0.0.1:8472` | netd | fake DNS listener |
-| `HITMAN_DNS_UPSTREAM` | `1.1.1.1:53` | MITM + netd | DNS upstream for non-target resolver-zone names and real-IP resolution in `system` mode |
-| `HITMAN_FAKEIP_CIDR` | `198.18.0.0/15` | netd | fake-IP pool and TUN route |
-| `HITMAN_TUN_ADDRESS` | `172.31.255.1/30` | netd | utun interface address |
-| `HITMAN_DOMAINS` | `chatgpt.com,api.anthropic.com,generativelanguage.googleapis.com,aiplatform.googleapis.com` | netd | exact fake-DNS targets |
-| `HITMAN_DOMAIN_SUFFIXES` | `aiplatform.googleapis.com` | netd | suffix fake-DNS targets; matches Vertex region hosts |
-| `HITMAN_RESOLVER_DOMAINS` | `chatgpt.com,anthropic.com,googleapis.com` | netd | `/etc/resolver/<domain>` files to manage |
-| `HITMAN_PROCESSES` | `codex,claude,claude.exe,gemini,omp,pi,agy` | netd | process basenames allowed into MITM |
-| `HITMAN_PROCESS_PATHS` | empty | netd | exact process paths allowed into MITM |
-| `HITMAN_MAX_CONTINUE` | `0` | MITM | Codex fold continuation rounds; `0` means audit only |
-| `HITMAN_AUDIT_BODIES` | `true` | MITM | write request bodies |
+| `listen` | `127.0.0.1:8471` | MITM | HTTPS MITM listener |
+| `upstreamMode` | `system` | MITM + netd | `system` or `proxy`; `direct` is accepted as an alias for `system` |
+| `upstreamProxy` | empty | MITM + netd | SOCKS5 or HTTP CONNECT proxy address in `proxy` mode; if set without `upstreamMode`, mode is inferred as `proxy` |
+| `upstreamDNS` | `1.1.1.1:53` | MITM + netd | DNS upstream for non-target resolver-zone names and real-IP resolution in `system` mode |
+| `caDir` | `ca` | MITM + script | local CA directory |
+| `auditDir` | `audit` | MITM | per-day audit output directory |
+| `allowHosts` | target hosts | MITM | defense-in-depth upstream Host allowlist |
+| `netDNS` | `127.0.0.1:8472` | netd + script | fake DNS listener |
+| `mitmAddr` | `127.0.0.1:8471` | netd | MITM listener that matching flows are piped into |
+| `fakeIPCIDR` | `198.18.0.0/15` | MITM + netd | fake-IP pool, TUN route, and system-mode loop guard |
+| `tunAddress` | `172.31.255.1/30` | netd | utun interface address |
+| `tunName` | empty | netd | optional utun name hint |
+| `domains` | `chatgpt.com,api.anthropic.com,generativelanguage.googleapis.com,aiplatform.googleapis.com` | netd | exact fake-DNS targets |
+| `domainSuffixes` | `aiplatform.googleapis.com` | netd | suffix fake-DNS targets; matches Vertex region hosts |
+| `resolverDomains` | `chatgpt.com,anthropic.com,googleapis.com` | netd + script | `/etc/resolver/<domain>` files to manage |
+| `processes` | `codex,claude,claude.exe,gemini,omp,pi,agy` | netd | process basenames allowed into MITM |
+| `processPaths` | empty | netd | exact process paths allowed into MITM |
+| `markerText` | `Continue thinking...` | MITM | Codex folding marker |
+| `truncationStep` | `518` | MITM | Codex fold truncation step |
+| `maxTierN` | `6` | MITM | Codex fold tier cap |
+| `maxContinue` | `0` | MITM | Codex fold continuation rounds; `0` means audit only |
+| `debug` | `false` | MITM | verbose debug logging |
+| `auditBodies` | `true` | MITM | write request bodies |
 
-The legacy `HITMAN_SOCKS` variable is still accepted as a fallback for
-`HITMAN_UPSTREAM_PROXY`.
+`HITMAN_*` environment variables are still accepted as transient overrides for
+development and one-off launches, but the control script no longer writes them
+into launchd plists. The legacy `HITMAN_SOCKS` variable is still accepted as a
+fallback for `upstreamProxy`.
 
 ## Files Owned By hitman
 
@@ -197,11 +241,11 @@ to fail instead of being overwritten.
 
 | Symptom | Check |
 |---|---|
-| No Anthropic/Gemini audit lines | `./hitman status`; confirm netd is loaded, DNS `:8472` is listening, resolver files exist, and process name is in `HITMAN_PROCESSES`. |
+| No Anthropic/Gemini audit lines | `./hitman status`; confirm netd is loaded, DNS `:8472` is listening, resolver files exist, and process name is in `processes`. |
 | Agent reports certificate error | Run `./hitman ca-trust`, or pass `NODE_EXTRA_CA_CERTS=$PWD/ca/hitman-ca.pem` for Node-based CLIs. |
 | `netd` keeps restarting | `./hitman logs`; common causes are missing `with_gvisor` build, existing non-hitman `/etc/resolver/*` files, or unreachable privileges. |
-| Upstream calls fail after MITM | `./hitman status`; in `proxy` mode confirm `HITMAN_UPSTREAM_PROXY` points at a reachable socks/http proxy; in `system` mode confirm `HITMAN_DNS_UPSTREAM` can resolve real upstream IPs and system routing is available. |
-| Some googleapis domains break | Non-target names under `googleapis.com` are forwarded to `HITMAN_DNS_UPSTREAM`; set that to a DNS server reachable on your network. |
+| Upstream calls fail after MITM | `./hitman status`; in `proxy` mode confirm `upstreamProxy` points at a reachable socks/http proxy; in `system` mode confirm `upstreamDNS` can resolve real upstream IPs and system routing is available. |
+| Some googleapis domains break | Non-target names under `googleapis.com` are forwarded to `upstreamDNS`; set that to a DNS server reachable on your network. |
 | Want to disable capture immediately | `./hitman off`; this stops netd and removes hitman-managed resolver files. The MITM service can stay running harmlessly. |
 
 ## Development

@@ -1,8 +1,8 @@
 package main
 
 import (
-	"os"
-	"strconv"
+	"fmt"
+	"net/netip"
 	"strings"
 )
 
@@ -16,14 +16,15 @@ const (
 	defaultMaxContinue = 0
 )
 
-// appConfig is the fully-resolved runtime configuration. Everything is
-// overridable via HITMAN_* environment variables so the launchd plist / hitman
-// script can tune behaviour without touching code.
+// appConfig is the fully-resolved runtime configuration. Values come from
+// ~/.config/hitman/config.json, with HITMAN_* environment variables kept as
+// transient overrides for development and one-off launches.
 type appConfig struct {
-	ListenAddr    string   // TLS listener agent traffic is redirected to
-	UpstreamMode  string   // proxy or system
-	UpstreamProxy string   // sing-box socks/mixed inbound used for real egress
-	UpstreamDNS   string   // resolver used by system upstream mode
+	ListenAddr    string // TLS listener agent traffic is redirected to
+	UpstreamMode  string // proxy or system
+	UpstreamProxy string // sing-box socks/mixed inbound used for real egress
+	UpstreamDNS   string // resolver used by system upstream mode
+	FakeIPCIDR    netip.Prefix
 	SocksAddr     string   // deprecated alias for old tests/scripts
 	CADir         string   // holds hitman-ca.pem / .key
 	AuditDir      string   // per-day audit output
@@ -46,23 +47,35 @@ type foldConfig struct {
 	DebugLog       bool
 }
 
-func loadConfig() appConfig {
-	upstreamProxy := normalizeProxy(envOr("HITMAN_UPSTREAM_PROXY", envOr("HITMAN_SOCKS", "127.0.0.1:2333")))
+func loadConfig() (appConfig, error) {
+	fileCfg, err := loadFileConfig()
+	if err != nil {
+		return appConfig{}, fmt.Errorf("load config %s: %w", defaultConfigPath(), err)
+	}
+	upstreamProxy := configUpstreamProxy(fileCfg)
+	fakeCIDR, err := netip.ParsePrefix(configString("HITMAN_FAKEIP_CIDR", fileCfg.FakeIPCIDR, defaultFakeIPCIDR))
+	if err != nil {
+		return appConfig{}, fmt.Errorf("parse HITMAN_FAKEIP_CIDR: %w", err)
+	}
+	if !fakeCIDR.Addr().Is4() {
+		return appConfig{}, fmt.Errorf("HITMAN_FAKEIP_CIDR must be IPv4")
+	}
 	c := appConfig{
-		ListenAddr:     envOr("HITMAN_LISTEN", "127.0.0.1:8471"),
-		UpstreamMode:   normalizeUpstreamMode(envOr("HITMAN_UPSTREAM_MODE", defaultUpstreamMode)),
+		ListenAddr:     configString("HITMAN_LISTEN", fileCfg.ListenAddr, "127.0.0.1:8471"),
+		UpstreamMode:   configUpstreamMode(fileCfg, upstreamProxy),
 		UpstreamProxy:  upstreamProxy,
-		UpstreamDNS:    envOr("HITMAN_DNS_UPSTREAM", defaultUpstreamDNS),
+		UpstreamDNS:    configString("HITMAN_DNS_UPSTREAM", fileCfg.UpstreamDNS, defaultUpstreamDNS),
+		FakeIPCIDR:     fakeCIDR.Masked(),
 		SocksAddr:      upstreamProxy,
-		CADir:          envOr("HITMAN_CA_DIR", "ca"),
-		AuditDir:       envOr("HITMAN_AUDIT_DIR", "audit"),
-		AllowHosts:     splitCSV(envOr("HITMAN_ALLOW_HOSTS", defaultAllowHosts)),
-		MarkerText:     envOr("HITMAN_MARKER", defaultMarkerText),
-		TruncationStep: envInt("HITMAN_TRUNCATION_STEP", defaultTruncationStep),
-		MaxTierN:       envInt("HITMAN_MAX_TIER_N", defaultMaxTierN),
-		MaxContinue:    envInt("HITMAN_MAX_CONTINUE", defaultMaxContinue),
-		DebugLog:       envBool("HITMAN_DEBUG", false),
-		AuditBodies:    envBool("HITMAN_AUDIT_BODIES", true),
+		CADir:          configString("HITMAN_CA_DIR", fileCfg.CADir, "ca"),
+		AuditDir:       configString("HITMAN_AUDIT_DIR", fileCfg.AuditDir, "audit"),
+		AllowHosts:     configList("HITMAN_ALLOW_HOSTS", fileCfg.AllowHosts, defaultAllowHosts),
+		MarkerText:     configString("HITMAN_MARKER", fileCfg.MarkerText, defaultMarkerText),
+		TruncationStep: configInt("HITMAN_TRUNCATION_STEP", fileCfg.TruncationStep, defaultTruncationStep),
+		MaxTierN:       configInt("HITMAN_MAX_TIER_N", fileCfg.MaxTierN, defaultMaxTierN),
+		MaxContinue:    configInt("HITMAN_MAX_CONTINUE", fileCfg.MaxContinue, defaultMaxContinue),
+		DebugLog:       configBool("HITMAN_DEBUG", fileCfg.DebugLog, false),
+		AuditBodies:    configBool("HITMAN_AUDIT_BODIES", fileCfg.AuditBodies, true),
 	}
 	if strings.TrimSpace(c.MarkerText) == "" {
 		c.MarkerText = defaultMarkerText
@@ -76,7 +89,7 @@ func loadConfig() appConfig {
 	if c.MaxContinue < 0 {
 		c.MaxContinue = defaultMaxContinue
 	}
-	return c
+	return c, nil
 }
 
 func (c appConfig) fold() foldConfig {
@@ -87,31 +100,6 @@ func (c appConfig) fold() foldConfig {
 		MaxContinue:    c.MaxContinue,
 		DebugLog:       c.DebugLog,
 	}
-}
-
-func envOr(key, def string) string {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		return v
-	}
-	return def
-}
-
-func envInt(key string, def int) int {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-	}
-	return def
-}
-
-func envBool(key string, def bool) bool {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			return b
-		}
-	}
-	return def
 }
 
 func splitCSV(s string) []string {

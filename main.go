@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"syscall"
@@ -35,7 +36,10 @@ func main() {
 }
 
 func runServe() {
-	cfg := loadConfig()
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("fatal: config: %v", err)
+	}
 
 	caObj, err := loadOrCreateCA(cfg.CADir)
 	if err != nil {
@@ -79,7 +83,7 @@ func runServe() {
 }
 
 func upstreamLabel(cfg appConfig) string {
-	_, label, err := upstreamDialContext(cfg.UpstreamMode, cfg.UpstreamProxy, cfg.UpstreamDNS, fakeIPPrefixesFromEnv())
+	_, label, err := upstreamDialContext(cfg.UpstreamMode, cfg.UpstreamProxy, cfg.UpstreamDNS, []netip.Prefix{cfg.FakeIPCIDR})
 	if err != nil {
 		return "invalid (" + err.Error() + ")"
 	}
