@@ -44,6 +44,16 @@ plist_set_string_sudo() {
     || sudo "$PB" -c "Add $key string $val" "$p"
 }
 
+plist_delete() {
+  local p="$1" key="$2"
+  "$PB" -c "Delete $key" "$p" 2>/dev/null || true
+}
+
+plist_delete_sudo() {
+  local p="$1" key="$2"
+  sudo "$PB" -c "Delete $key" "$p" 2>/dev/null || true
+}
+
 effective_upstream_proxy() {
   echo "${HITMAN_UPSTREAM_PROXY:-${HITMAN_SOCKS:-$DEFAULT_UPSTREAM_PROXY}}"
 }
@@ -70,6 +80,7 @@ render_user_plist() {
   plist_set_string "$p" ":EnvironmentVariables:HITMAN_DNS_UPSTREAM" "$(effective_dns_upstream)"
   plist_set_string "$p" ":EnvironmentVariables:HITMAN_ALLOW_HOSTS" "${HITMAN_ALLOW_HOSTS:-$(effective_domains)}"
   plist_set_string "$p" ":EnvironmentVariables:HOME" "$HOME"
+  plist_delete "$p" ":EnvironmentVariables:HITMAN_SOCKS"
 }
 
 render_net_plist() {
@@ -90,6 +101,7 @@ render_net_plist() {
   plist_set_string "$p" ":EnvironmentVariables:HITMAN_NETD_DNS" "${HITMAN_NETD_DNS:-127.0.0.1:$DNS_PORT}"
   plist_set_string "$p" ":EnvironmentVariables:HITMAN_DNS_UPSTREAM" "$(effective_dns_upstream)"
   plist_set_string "$p" ":EnvironmentVariables:HOME" "$HOME"
+  plist_delete "$p" ":EnvironmentVariables:HITMAN_SOCKS"
 }
 
 cmd_build() {
@@ -99,13 +111,55 @@ cmd_build() {
   echo "built $DIR/bin/hitman (with_gvisor)"
 }
 
+start_user_service() {
+  local err
+  err="$(mktemp)"
+  launchctl bootout "$GUI/$LABEL" 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    if launchctl bootstrap "$GUI" "$PLIST_DST" 2>"$err"; then
+      break
+    fi
+    if launchctl print "$GUI/$LABEL" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.2
+  done
+  if ! launchctl print "$GUI/$LABEL" >/dev/null 2>&1; then
+    cat "$err" >&2
+    rm -f "$err"
+    return 1
+  fi
+  rm -f "$err"
+  launchctl kickstart -k "$GUI/$LABEL"
+}
+
+start_net_service() {
+  local err
+  err="$(mktemp)"
+  sudo launchctl bootout "system/$NET_LABEL" 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    if sudo launchctl bootstrap system "$NET_PLIST_DST" 2>"$err"; then
+      break
+    fi
+    if sudo launchctl print "system/$NET_LABEL" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.2
+  done
+  if ! sudo launchctl print "system/$NET_LABEL" >/dev/null 2>&1; then
+    cat "$err" >&2
+    rm -f "$err"
+    return 1
+  fi
+  rm -f "$err"
+  sudo launchctl kickstart -k "system/$NET_LABEL"
+}
+
 cmd_install_user() {
   mkdir -p "$DIR/logs" "$(dirname "$PLIST_DST")"
   cp "$PLIST_SRC" "$PLIST_DST"
   render_user_plist "$PLIST_DST"
-  launchctl bootout "$GUI/$LABEL" 2>/dev/null || true
-  launchctl bootstrap "$GUI" "$PLIST_DST" 2>/dev/null || true
-  launchctl kickstart -k "$GUI/$LABEL"
+  start_user_service
   echo "installed + started user service $LABEL"
 }
 
@@ -120,9 +174,7 @@ cmd_install_net() {
   rm -f "$tmp"
   sudo chown root:wheel "$NET_PLIST_DST"
   sudo chmod 644 "$NET_PLIST_DST"
-  sudo launchctl bootout "system/$NET_LABEL" 2>/dev/null || true
-  sudo launchctl bootstrap system "$NET_PLIST_DST"
-  sudo launchctl kickstart -k "system/$NET_LABEL"
+  start_net_service
   echo "installed + started root service $NET_LABEL"
 }
 
@@ -155,9 +207,13 @@ cmd_uninstall() {
 }
 
 cmd_restart() {
-  launchctl kickstart -k "$GUI/$LABEL"
-  sudo launchctl kickstart -k "system/$NET_LABEL"
-  echo "restarted $LABEL and $NET_LABEL"
+  start_user_service
+  if [ -f "$NET_PLIST_DST" ]; then
+    start_net_service
+    echo "restarted $LABEL and $NET_LABEL"
+  else
+    echo "restarted $LABEL (netd is not installed)"
+  fi
 }
 
 cmd_on() {
@@ -185,11 +241,13 @@ cmd_upstream() {
     plist_set_string "$p" ":EnvironmentVariables:HITMAN_UPSTREAM_MODE" "$upstream_mode"
     plist_set_string "$p" ":EnvironmentVariables:HITMAN_UPSTREAM_PROXY" "$val"
     plist_set_string "$p" ":EnvironmentVariables:HITMAN_DNS_UPSTREAM" "$(effective_dns_upstream)"
+    plist_delete "$p" ":EnvironmentVariables:HITMAN_SOCKS"
   done
   if [ -f "$NET_PLIST_DST" ]; then
     plist_set_string_sudo "$NET_PLIST_DST" ":EnvironmentVariables:HITMAN_UPSTREAM_MODE" "$upstream_mode"
     plist_set_string_sudo "$NET_PLIST_DST" ":EnvironmentVariables:HITMAN_UPSTREAM_PROXY" "$val"
     plist_set_string_sudo "$NET_PLIST_DST" ":EnvironmentVariables:HITMAN_DNS_UPSTREAM" "$(effective_dns_upstream)"
+    plist_delete_sudo "$NET_PLIST_DST" ":EnvironmentVariables:HITMAN_SOCKS"
   fi
   echo "upstream mode set to: $upstream_mode"
   if [ "$upstream_mode" = "proxy" ]; then
@@ -197,8 +255,13 @@ cmd_upstream() {
   else
     echo "upstream system DNS: $(effective_dns_upstream)"
   fi
-  if [ -f "$PLIST_DST" ] && [ -f "$NET_PLIST_DST" ]; then
-    cmd_restart
+  if [ -f "$PLIST_DST" ]; then
+    start_user_service
+    echo "restarted $LABEL"
+  fi
+  if [ -f "$NET_PLIST_DST" ]; then
+    start_net_service
+    echo "restarted $NET_LABEL"
   fi
 }
 
@@ -218,6 +281,15 @@ print_launchd_state() {
   fi
 }
 
+read_saved_upstream_env() {
+  local key="$1" fallback="$2" p
+  for p in "$NET_PLIST_DST" "$PLIST_DST" "$NET_PLIST_SRC" "$PLIST_SRC"; do
+    [ -f "$p" ] || continue
+    "$PB" -c "Print :EnvironmentVariables:$key" "$p" 2>/dev/null && return 0
+  done
+  echo "$fallback"
+}
+
 cmd_status() {
   local upstream_mode proxy hp host port dns_upstream
   echo "== launchd =="
@@ -229,14 +301,9 @@ cmd_status() {
   if lsof -nP -iUDP:"$DNS_PORT" >/dev/null 2>&1 || lsof -nP -iTCP:"$DNS_PORT" -sTCP:LISTEN >/dev/null 2>&1; then echo "  dns  :$DNS_PORT listening"; else echo "  dns  :$DNS_PORT NOT listening"; fi
 
   echo "== upstream =="
-  upstream_mode="$(effective_upstream_mode)"
-  proxy="$(effective_upstream_proxy)"
-  dns_upstream="$(effective_dns_upstream)"
-  if [ -f "$NET_PLIST_DST" ]; then
-    upstream_mode="$("$PB" -c 'Print :EnvironmentVariables:HITMAN_UPSTREAM_MODE' "$NET_PLIST_DST" 2>/dev/null || echo "$upstream_mode")"
-    proxy="$("$PB" -c 'Print :EnvironmentVariables:HITMAN_UPSTREAM_PROXY' "$NET_PLIST_DST" 2>/dev/null || echo "$proxy")"
-    dns_upstream="$("$PB" -c 'Print :EnvironmentVariables:HITMAN_DNS_UPSTREAM' "$NET_PLIST_DST" 2>/dev/null || echo "$dns_upstream")"
-  fi
+  upstream_mode="$(read_saved_upstream_env HITMAN_UPSTREAM_MODE "$(effective_upstream_mode)")"
+  proxy="$(read_saved_upstream_env HITMAN_UPSTREAM_PROXY "$(effective_upstream_proxy)")"
+  dns_upstream="$(read_saved_upstream_env HITMAN_DNS_UPSTREAM "$(effective_dns_upstream)")"
   echo "  mode: $upstream_mode"
   if [ "$upstream_mode" = "system" ] || [ "$upstream_mode" = "direct" ]; then
     echo "  real-IP DNS: $dns_upstream"
