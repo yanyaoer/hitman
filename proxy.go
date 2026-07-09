@@ -52,14 +52,14 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// allowlisted upstream hosts. sing-box already scopes what reaches us, but this
 	// prevents a misrouted/redirected request from leaking the Bearer to any Host.
 	if !hostAllowed(s.cfg.AllowHosts, r.Host) {
-		http.Error(w, "bridge: host not allowed: "+r.Host, http.StatusForbidden)
+		http.Error(w, "hitman: host not allowed: "+r.Host, http.StatusForbidden)
 		return
 	}
 	// Reject WebSocket upgrades fast so codex falls back to the HTTP/SSE responses
 	// transport, which is the path we fold. We deliberately do not proxy the WS
 	// transport (its frames would need parsing to fold).
 	if strings.Contains(strings.ToLower(r.Header.Get("Upgrade")), "websocket") {
-		http.Error(w, "bridge: websocket transport not supported; use HTTPS/SSE", http.StatusUpgradeRequired)
+		http.Error(w, "hitman: websocket transport not supported; use HTTPS/SSE", http.StatusUpgradeRequired)
 		return
 	}
 	if r.Method == http.MethodPost && r.URL.Path == "/backend-api/codex/responses" {
@@ -99,7 +99,7 @@ func (s *server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	rec := s.audit.begin(r, "passthrough", nil)
 	defer rec.done()
 	if err != nil {
-		http.Error(w, "bridge: read request body: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "hitman: read request body: "+err.Error(), http.StatusBadRequest)
 		rec.fields(map[string]any{"status": 400, "error": err.Error()})
 		return
 	}
@@ -112,7 +112,7 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	rec := s.audit.begin(r, "responses", body)
 	defer rec.done()
 	if err != nil {
-		http.Error(w, "bridge: read request body: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "hitman: read request body: "+err.Error(), http.StatusBadRequest)
 		rec.fields(map[string]any{"status": 400, "error": err.Error()})
 		return
 	}
@@ -175,14 +175,14 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 func (s *server) forward(w http.ResponseWriter, r *http.Request, body []byte, rec *auditRecord, audit bool) {
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL(r), bytes.NewReader(body))
 	if err != nil {
-		http.Error(w, "bridge: build request: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "hitman: build request: "+err.Error(), http.StatusBadGateway)
 		rec.fields(map[string]any{"status": 502, "error": err.Error()})
 		return
 	}
 	applyReplayHeaders(req.Header, r.Header)
 	resp, err := s.client.Do(req)
 	if err != nil {
-		http.Error(w, "bridge: upstream error: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "hitman: upstream error: "+err.Error(), http.StatusBadGateway)
 		rec.fields(map[string]any{"status": 502, "error": err.Error()})
 		return
 	}

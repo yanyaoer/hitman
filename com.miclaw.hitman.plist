@@ -4,7 +4,7 @@
 <dict>
 	<key>EnvironmentVariables</key>
 	<dict>
-		<key>AI_BRIDGE_SOCKS</key>
+		<key>HITMAN_SOCKS</key>
 		<string>direct</string>
 		<key>HOME</key>
 		<string>/Users/yanyao</string>
@@ -14,20 +14,20 @@
 	<key>KeepAlive</key>
 	<true/>
 	<key>Label</key>
-	<string>com.yanyao.ai-bridge</string>
+	<string>com.miclaw.hitman</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Users/yanyao/Projects/side/ai-bridge/bin/ai-bridge</string>
+		<string>/Users/yanyao/Projects/side/hitman/bin/hitman</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardErrorPath</key>
-	<string>/Users/yanyao/Projects/side/ai-bridge/logs/cpa.err.log</string>
+	<string>/Users/yanyao/Projects/side/hitman/logs/hitman.err.log</string>
 	<key>StandardOutPath</key>
-	<string>/Users/yanyao/Projects/side/ai-bridge/logs/cpa.out.log</string>
+	<string>/Users/yanyao/Projects/side/hitman/logs/hitman.out.log</string>
 	<key>ThrottleInterval</key>
 	<integer>10</integer>
 	<key>WorkingDirectory</key>
-	<string>/Users/yanyao/Projects/side/ai-bridge</string>
+	<string>/Users/yanyao/Projects/side/hitman</string>
 </dict>
 </plist>

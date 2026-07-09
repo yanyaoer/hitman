@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const caCommonName = "ai-bridge CA"
+const caCommonName = "hitman CA"
 
 type ca struct {
 	cert    *x509.Certificate
@@ -28,8 +28,8 @@ func loadOrCreateCA(dir string) (*ca, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	certPath := filepath.Join(dir, "ai-bridge-ca.pem")
-	keyPath := filepath.Join(dir, "ai-bridge-ca.key")
+	certPath := filepath.Join(dir, "hitman-ca.pem")
+	keyPath := filepath.Join(dir, "hitman-ca.key")
 	if fileExists(certPath) && fileExists(keyPath) {
 		return loadCA(certPath, keyPath)
 	}
@@ -75,7 +75,7 @@ func createCA(certPath, keyPath string) (*ca, error) {
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: caCommonName, Organization: []string{"ai-bridge"}},
+		Subject:               pkix.Name{CommonName: caCommonName, Organization: []string{"hitman"}},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().AddDate(10, 0, 0),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,

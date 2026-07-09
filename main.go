@@ -16,14 +16,14 @@ import (
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
-	log.SetPrefix("ai-bridge ")
+	log.SetPrefix("hitman ")
 
 	// This binary is the gateway server and takes no subcommands; control commands
-	// (init/on/off/status/...) live in the `bridge` script. Guard against the easy
-	// mix-up so `./ai-bridge init` gives a hint instead of trying to bind the port.
+	// (init/on/off/status/...) live in the `hitman` script. Guard against the easy
+	// mix-up so `./hitman init` gives a hint instead of trying to bind the port.
 	if len(os.Args) > 1 {
-		fmt.Fprintln(os.Stderr, "ai-bridge is the gateway server binary and takes no subcommands.")
-		fmt.Fprintf(os.Stderr, "Did you mean the control script?  ./bridge %s\n", os.Args[1])
+		fmt.Fprintln(os.Stderr, "hitman is the gateway server binary and takes no subcommands.")
+		fmt.Fprintf(os.Stderr, "Did you mean the control script?  ./hitman %s\n", os.Args[1])
 		os.Exit(2)
 	}
 

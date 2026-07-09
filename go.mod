@@ -1,3 +1,3 @@
-module ai-bridge
+module hitman
 
 go 1.26
