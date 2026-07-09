@@ -90,7 +90,7 @@ run `./hitman install`, wait a second, then run `./hitman ca-trust`.
 ## Daily Commands
 
 ```bash
-./hitman on              # build + start MITM and netd
+./hitman on              # build + start MITM plus root netd capture
 ./hitman off             # stop netd and remove hitman-managed resolver files
 ./hitman status          # services, listeners, proxy, fake route, resolvers, CA
 ./hitman logs            # tail MITM and netd logs
@@ -119,6 +119,12 @@ In `system` mode, hitman does not use macOS resolver for upstream hosts. It asks
 `HITMAN_FAKEIP_CIDR`, dials the real IP, and then macOS routing decides the next
 hop. This avoids the hitman fake-DNS loop while allowing the system VPN/TUN route
 to carry the connection if one is active.
+
+`./hitman on` is the SFM-free capture switch. It builds the with-gVisor binary,
+starts the user MITM LaunchAgent, starts the root `netd` LaunchDaemon, installs
+hitman-managed `/etc/resolver/*` files, opens fake DNS on `127.0.0.1:8472`, and
+adds the `198.18.0.0/15` fake-IP route through the hitman utun interface. It does
+not edit SFM, sing-box, or mihomo config.
 
 ## Audit Layout
 
@@ -213,6 +219,11 @@ network smoke requires the installed services:
 ./hitman on
 ./hitman smoke
 ```
+
+`smoke` compiles a temporary client whose process basename is `codex`, sends a
+request through normal system DNS, and passes when the DNS/TUN/netd/MITM path
+returns an HTTP response. The upstream status code is printed because the check
+is for network interception, not model generation.
 
 ## Credits
 

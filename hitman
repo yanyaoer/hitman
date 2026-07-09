@@ -54,6 +54,26 @@ plist_delete_sudo() {
   sudo "$PB" -c "Delete $key" "$p" 2>/dev/null || true
 }
 
+plist_get_string() {
+  local p="$1" key="$2"
+  "$PB" -c "Print $key" "$p" 2>/dev/null || true
+}
+
+env_or_plist_or_default() {
+  local env_name="$1" p="$2" key="$3" fallback="$4" val
+  val="${!env_name:-}"
+  if [ -n "$val" ]; then
+    echo "$val"
+    return
+  fi
+  val="$(plist_get_string "$p" "$key")"
+  if [ -n "$val" ]; then
+    echo "$val"
+    return
+  fi
+  echo "$fallback"
+}
+
 effective_upstream_proxy() {
   echo "${HITMAN_UPSTREAM_PROXY:-${HITMAN_SOCKS:-$DEFAULT_UPSTREAM_PROXY}}"
 }
@@ -68,38 +88,62 @@ effective_processes() { echo "${HITMAN_PROCESSES:-$DEFAULT_HITMAN_PROCESSES}"; }
 effective_resolver_domains() { echo "${HITMAN_RESOLVER_DOMAINS:-$DEFAULT_HITMAN_RESOLVER_DOMAINS}"; }
 effective_dns_upstream() { echo "${HITMAN_DNS_UPSTREAM:-$DEFAULT_DNS_UPSTREAM}"; }
 
+saved_upstream_proxy() {
+  local p="$1" val
+  if [ -n "${HITMAN_UPSTREAM_PROXY:-}" ]; then
+    echo "$HITMAN_UPSTREAM_PROXY"
+    return
+  fi
+  if [ -n "${HITMAN_SOCKS:-}" ]; then
+    echo "$HITMAN_SOCKS"
+    return
+  fi
+  val="$(plist_get_string "$p" ":EnvironmentVariables:HITMAN_UPSTREAM_PROXY")"
+  if [ -n "$val" ]; then
+    echo "$val"
+    return
+  fi
+  echo "$DEFAULT_UPSTREAM_PROXY"
+}
+
 render_user_plist() {
-  local p="$1"
+  local p="$1" upstream_mode upstream_proxy dns_upstream
+  upstream_mode="$(env_or_plist_or_default HITMAN_UPSTREAM_MODE "$p" ":EnvironmentVariables:HITMAN_UPSTREAM_MODE" "$DEFAULT_UPSTREAM_MODE")"
+  upstream_proxy="$(saved_upstream_proxy "$p")"
+  dns_upstream="$(env_or_plist_or_default HITMAN_DNS_UPSTREAM "$p" ":EnvironmentVariables:HITMAN_DNS_UPSTREAM" "$DEFAULT_DNS_UPSTREAM")"
   plist_set_string "$p" ":Label" "$LABEL"
   plist_set_string "$p" ":ProgramArguments:0" "$DIR/bin/hitman"
   plist_set_string "$p" ":StandardErrorPath" "$LOG_ERR"
   plist_set_string "$p" ":StandardOutPath" "$LOG_OUT"
   plist_set_string "$p" ":WorkingDirectory" "$DIR"
-  plist_set_string "$p" ":EnvironmentVariables:HITMAN_UPSTREAM_MODE" "$(effective_upstream_mode)"
-  plist_set_string "$p" ":EnvironmentVariables:HITMAN_UPSTREAM_PROXY" "$(effective_upstream_proxy)"
-  plist_set_string "$p" ":EnvironmentVariables:HITMAN_DNS_UPSTREAM" "$(effective_dns_upstream)"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_UPSTREAM_MODE" "$upstream_mode"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_UPSTREAM_PROXY" "$upstream_proxy"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_DNS_UPSTREAM" "$dns_upstream"
   plist_set_string "$p" ":EnvironmentVariables:HITMAN_ALLOW_HOSTS" "${HITMAN_ALLOW_HOSTS:-$(effective_domains)}"
   plist_set_string "$p" ":EnvironmentVariables:HOME" "$HOME"
   plist_delete "$p" ":EnvironmentVariables:HITMAN_SOCKS"
 }
 
 render_net_plist() {
-  local p="$1"
+  local p="$1" upstream_mode upstream_proxy dns_upstream
+  upstream_mode="$(env_or_plist_or_default HITMAN_UPSTREAM_MODE "$p" ":EnvironmentVariables:HITMAN_UPSTREAM_MODE" "$DEFAULT_UPSTREAM_MODE")"
+  upstream_proxy="$(saved_upstream_proxy "$p")"
+  dns_upstream="$(env_or_plist_or_default HITMAN_DNS_UPSTREAM "$p" ":EnvironmentVariables:HITMAN_DNS_UPSTREAM" "$DEFAULT_DNS_UPSTREAM")"
   plist_set_string "$p" ":Label" "$NET_LABEL"
   plist_set_string "$p" ":ProgramArguments:0" "$DIR/bin/hitman"
   plist_set_string "$p" ":ProgramArguments:1" "netd"
   plist_set_string "$p" ":StandardErrorPath" "$NET_LOG_ERR"
   plist_set_string "$p" ":StandardOutPath" "$NET_LOG_OUT"
   plist_set_string "$p" ":WorkingDirectory" "$DIR"
-  plist_set_string "$p" ":EnvironmentVariables:HITMAN_UPSTREAM_MODE" "$(effective_upstream_mode)"
-  plist_set_string "$p" ":EnvironmentVariables:HITMAN_UPSTREAM_PROXY" "$(effective_upstream_proxy)"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_UPSTREAM_MODE" "$upstream_mode"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_UPSTREAM_PROXY" "$upstream_proxy"
   plist_set_string "$p" ":EnvironmentVariables:HITMAN_DOMAINS" "$(effective_domains)"
   plist_set_string "$p" ":EnvironmentVariables:HITMAN_DOMAIN_SUFFIXES" "$(effective_domain_suffixes)"
   plist_set_string "$p" ":EnvironmentVariables:HITMAN_PROCESSES" "$(effective_processes)"
   plist_set_string "$p" ":EnvironmentVariables:HITMAN_RESOLVER_DOMAINS" "$(effective_resolver_domains)"
   plist_set_string "$p" ":EnvironmentVariables:HITMAN_MITM_ADDR" "${HITMAN_MITM_ADDR:-127.0.0.1:$PORT}"
   plist_set_string "$p" ":EnvironmentVariables:HITMAN_NETD_DNS" "${HITMAN_NETD_DNS:-127.0.0.1:$DNS_PORT}"
-  plist_set_string "$p" ":EnvironmentVariables:HITMAN_DNS_UPSTREAM" "$(effective_dns_upstream)"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_DNS_UPSTREAM" "$dns_upstream"
   plist_set_string "$p" ":EnvironmentVariables:HOME" "$HOME"
   plist_delete "$p" ":EnvironmentVariables:HITMAN_SOCKS"
 }
@@ -272,6 +316,20 @@ proxy_host_port() {
   echo "$proxy"
 }
 
+tcp_port_open() {
+  local port="$1"
+  nc -z 127.0.0.1 "$port" >/dev/null 2>&1 \
+    || lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 \
+    || sudo -n lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+dns_port_open() {
+  local port="$1"
+  tcp_port_open "$port" \
+    || lsof -nP -iUDP:"$port" >/dev/null 2>&1 \
+    || sudo -n lsof -nP -iUDP:"$port" >/dev/null 2>&1
+}
+
 print_launchd_state() {
   local label="$1" name="$2" out
   if out="$(launchctl print "$label" 2>/dev/null)"; then
@@ -297,8 +355,8 @@ cmd_status() {
   print_launchd_state "system/$NET_LABEL" "netd"
 
   echo "== listeners =="
-  if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then echo "  mitm :$PORT listening"; else echo "  mitm :$PORT NOT listening"; fi
-  if lsof -nP -iUDP:"$DNS_PORT" >/dev/null 2>&1 || lsof -nP -iTCP:"$DNS_PORT" -sTCP:LISTEN >/dev/null 2>&1; then echo "  dns  :$DNS_PORT listening"; else echo "  dns  :$DNS_PORT NOT listening"; fi
+  if tcp_port_open "$PORT"; then echo "  mitm :$PORT listening"; else echo "  mitm :$PORT NOT listening"; fi
+  if dns_port_open "$DNS_PORT"; then echo "  dns  :$DNS_PORT listening"; else echo "  dns  :$DNS_PORT NOT listening"; fi
 
   echo "== upstream =="
   upstream_mode="$(read_saved_upstream_env HITMAN_UPSTREAM_MODE "$(effective_upstream_mode)")"
@@ -316,7 +374,7 @@ cmd_status() {
   fi
 
   echo "== route =="
-  if netstat -rn -f inet | awk '$1 ~ /^198\\.18\\./ || $1 == "198.18/15" || $1 == "198.18.0.0/15" {found=1; print "  " $0} END{exit !found}'; then
+  if netstat -rn -f inet | awk '$1 ~ /^198[.]18[.]/ || $1 == "198.18/15" || $1 == "198.18.0.0/15" {found=1; print "  " $0} END{exit !found}'; then
     :
   else
     echo "  fake-IP route not found"
@@ -374,29 +432,78 @@ codex_token() {
 }
 
 cmd_smoke() {
-  need curl
+  need go
   [ -f "$CA_PEM" ] || die "CA not found at $CA_PEM"
-  if ! lsof -nP -iUDP:"$DNS_PORT" >/dev/null 2>&1; then
+  if ! dns_port_open "$DNS_PORT"; then
     die "netd DNS is not listening on :$DNS_PORT (run ./hitman on)"
   fi
-  local token tmp curl_bin out
+  local token tmp out
   token="$(codex_token)"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
-  curl_bin="$(command -v curl)"
-  cp "$curl_bin" "$tmp/codex"
-  chmod +x "$tmp/codex"
-  echo "sending gpt-5.5 stream through DNS/TUN/netd as process name 'codex'..."
-  out="$("$tmp/codex" -sN --max-time 300 \
-    --cacert "$CA_PEM" \
-    "https://chatgpt.com/backend-api/codex/responses" \
-    -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
-    -H 'User-Agent: codex_cli_rs/0.142.5 (hitman smoke)' \
-    -d '{"model":"gpt-5.5","stream":true,"store":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Reply with the single word ok"}]}],"reasoning":{"effort":"low"}}' || true)"
-  if grep -q 'proxy_rounds\|response.completed' <<<"$out"; then
-    echo "SMOKE PASS: DNS/TUN/netd -> hitman relayed a terminal response.completed"
+  cat >"$tmp/smoke.go" <<'EOF'
+package main
+
+import (
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"time"
+)
+
+func main() {
+	token := os.Getenv("CODEX_TOKEN")
+	caPath := os.Getenv("HITMAN_CA_PEM")
+	if token == "" || caPath == "" {
+		fmt.Fprintln(os.Stderr, "missing CODEX_TOKEN or HITMAN_CA_PEM")
+		os.Exit(2)
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	pem, err := os.ReadFile(caPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if !pool.AppendCertsFromPEM(pem) {
+		fmt.Fprintln(os.Stderr, "failed to add hitman CA")
+		os.Exit(2)
+	}
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool},
+		},
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://chatgpt.com/backend-api/codex/models", nil)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "codex_cli_rs/0.142.5 (hitman smoke)")
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	fmt.Printf("status=%d bytes=%d\n", resp.StatusCode, n)
+}
+EOF
+  go build -trimpath -o "$tmp/codex" "$tmp/smoke.go"
+  echo "sending /backend-api/codex/models through DNS/TUN/netd as process name 'codex'..."
+  out="$(CODEX_TOKEN="$token" HITMAN_CA_PEM="$CA_PEM" GODEBUG=netdns=cgo "$tmp/codex" 2>&1 || true)"
+  if grep -q '^status=[1-5][0-9][0-9] bytes=' <<<"$out"; then
+    echo "SMOKE PASS: DNS/TUN/netd -> hitman relayed HTTP response ($out)"
   else
-    echo "SMOKE FAIL: no terminal event seen. Last lines:"; tail -n 5 <<<"$out"
+    echo "SMOKE FAIL: Codex models request failed. Output:"; tail -n 5 <<<"$out"
     return 1
   fi
 }
