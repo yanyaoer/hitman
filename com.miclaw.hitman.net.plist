@@ -14,17 +14,18 @@
 	<key>KeepAlive</key>
 	<true/>
 	<key>Label</key>
-	<string>com.miclaw.hitman</string>
+	<string>com.miclaw.hitman.net</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/Users/yanyao/Projects/side/hitman/bin/hitman</string>
+		<string>netd</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardErrorPath</key>
-	<string>/Users/yanyao/Projects/side/hitman/logs/hitman.err.log</string>
+	<string>/Users/yanyao/Projects/side/hitman/logs/hitman-net.err.log</string>
 	<key>StandardOutPath</key>
-	<string>/Users/yanyao/Projects/side/hitman/logs/hitman.out.log</string>
+	<string>/Users/yanyao/Projects/side/hitman/logs/hitman-net.out.log</string>
 	<key>ThrottleInterval</key>
 	<integer>10</integer>
 	<key>WorkingDirectory</key>

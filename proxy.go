@@ -4,11 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -28,12 +26,13 @@ func newServer(cfg appConfig, audit *auditor) *server {
 		ResponseHeaderTimeout: 120 * time.Second,
 		ExpectContinueTimeout: 2 * time.Second,
 	}
-	if cfg.SocksAddr == "" {
-		// Direct egress: dial the upstream straight and let the sing-box TUN capture
-		// and route it (works under strict_route, which can block the socks inbound).
-		transport.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	dialContext, _, err := proxyDialContext(cfg.UpstreamProxy, false)
+	if err != nil {
+		transport.DialContext = func(context.Context, string, string) (net.Conn, error) {
+			return nil, err
+		}
 	} else {
-		transport.DialContext = socks5DialContext(cfg.SocksAddr)
+		transport.DialContext = dialContext
 	}
 	return &server{
 		cfg:   cfg,
@@ -313,86 +312,5 @@ func copyResponseHeaders(dst, src http.Header) {
 			continue
 		}
 		dst[k] = append([]string(nil), vv...)
-	}
-}
-
-// socks5DialContext returns a DialContext that tunnels TCP through a SOCKS5 proxy
-// (no auth) using CONNECT with a domain target, so DNS/routing happens inside
-// sing-box (which resolves and routes chatgpt.com out to the selected node).
-func socks5DialContext(socksAddr string) func(ctx context.Context, network, addr string) (net.Conn, error) {
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, portStr, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, err
-		}
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return nil, err
-		}
-		d := net.Dialer{}
-		conn, err := d.DialContext(ctx, "tcp", socksAddr)
-		if err != nil {
-			return nil, err
-		}
-		// Bound the handshake reads/writes: DialContext only covers the TCP connect,
-		// so without a deadline a socks server that accepts but never replies would
-		// hang the request forever and leak the conn.
-		deadline, ok := ctx.Deadline()
-		if !ok {
-			deadline = time.Now().Add(15 * time.Second)
-		}
-		_ = conn.SetDeadline(deadline)
-		if err := socks5Handshake(conn, host, port); err != nil {
-			_ = conn.Close()
-			return nil, err
-		}
-		_ = conn.SetDeadline(time.Time{}) // clear for the streaming phase
-		return conn, nil
-	}
-}
-
-func socks5Handshake(conn net.Conn, host string, port int) error {
-	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-		return err
-	}
-	reply := make([]byte, 2)
-	if _, err := io.ReadFull(conn, reply); err != nil {
-		return err
-	}
-	if reply[0] != 0x05 || reply[1] != 0x00 {
-		return fmt.Errorf("socks5: unsupported auth method %d", reply[1])
-	}
-	if len(host) > 255 {
-		return fmt.Errorf("socks5: host too long")
-	}
-	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}
-	req = append(req, host...)
-	req = append(req, byte(port>>8), byte(port&0xff))
-	if _, err := conn.Write(req); err != nil {
-		return err
-	}
-	head := make([]byte, 4)
-	if _, err := io.ReadFull(conn, head); err != nil {
-		return err
-	}
-	if head[1] != 0x00 {
-		return fmt.Errorf("socks5: connect failed (rep=%d)", head[1])
-	}
-	switch head[3] {
-	case 0x01:
-		_, err := io.ReadFull(conn, make([]byte, 4+2))
-		return err
-	case 0x04:
-		_, err := io.ReadFull(conn, make([]byte, 16+2))
-		return err
-	case 0x03:
-		l := make([]byte, 1)
-		if _, err := io.ReadFull(conn, l); err != nil {
-			return err
-		}
-		_, err := io.ReadFull(conn, make([]byte, int(l[0])+2))
-		return err
-	default:
-		return fmt.Errorf("socks5: unknown atyp %d", head[3])
 	}
 }

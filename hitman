@@ -1,19 +1,34 @@
 #!/usr/bin/env bash
-# hitman control script. Manages build, CA trust, the sing-box redirect rule,
-# the launchd service, and smoke tests. See README.md.
+# hitman control script. Manages the user MITM service, the root netd service,
+# CA trust, status checks, and smoke tests. It does not edit SFM/sing-box config.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LABEL="com.miclaw.hitman"
+NET_LABEL="com.miclaw.hitman.net"
 PORT=8471
-SOCKS_PORT=2333
+DNS_PORT=8472
 CA_PEM="$DIR/ca/hitman-ca.pem"
 PLIST_SRC="$DIR/$LABEL.plist"
+NET_PLIST_SRC="$DIR/$NET_LABEL.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
+NET_PLIST_DST="/Library/LaunchDaemons/$NET_LABEL.plist"
 LOG_ERR="$DIR/logs/hitman.err.log"
 LOG_OUT="$DIR/logs/hitman.out.log"
+NET_LOG_ERR="$DIR/logs/hitman-net.err.log"
+NET_LOG_OUT="$DIR/logs/hitman-net.out.log"
 GUI="gui/$(id -u)"
 PB=/usr/libexec/PlistBuddy
+RESOLVER_MARKER="# hitman managed resolver"
+
+DEFAULT_HITMAN_DOMAINS="chatgpt.com,api.anthropic.com,generativelanguage.googleapis.com,aiplatform.googleapis.com"
+DEFAULT_HITMAN_DOMAIN_SUFFIXES="aiplatform.googleapis.com"
+DEFAULT_HITMAN_PROCESSES="codex,claude,claude.exe,gemini,omp,pi,agy"
+DEFAULT_HITMAN_RESOLVER_DOMAINS="chatgpt.com,anthropic.com,googleapis.com"
+DEFAULT_UPSTREAM_PROXY="socks5://127.0.0.1:2333"
+
+die() { echo "hitman: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 
 plist_set_string() {
   local p="$1" key="$2" val="$3"
@@ -21,116 +36,228 @@ plist_set_string() {
     || "$PB" -c "Add $key string $val" "$p"
 }
 
-render_launchd_plist() {
+plist_set_string_sudo() {
+  local p="$1" key="$2" val="$3"
+  sudo "$PB" -c "Set $key $val" "$p" 2>/dev/null \
+    || sudo "$PB" -c "Add $key string $val" "$p"
+}
+
+effective_upstream_proxy() {
+  echo "${HITMAN_UPSTREAM_PROXY:-${HITMAN_SOCKS:-$DEFAULT_UPSTREAM_PROXY}}"
+}
+
+effective_domains() { echo "${HITMAN_DOMAINS:-$DEFAULT_HITMAN_DOMAINS}"; }
+effective_domain_suffixes() { echo "${HITMAN_DOMAIN_SUFFIXES:-$DEFAULT_HITMAN_DOMAIN_SUFFIXES}"; }
+effective_processes() { echo "${HITMAN_PROCESSES:-$DEFAULT_HITMAN_PROCESSES}"; }
+effective_resolver_domains() { echo "${HITMAN_RESOLVER_DOMAINS:-$DEFAULT_HITMAN_RESOLVER_DOMAINS}"; }
+
+render_user_plist() {
   local p="$1"
   plist_set_string "$p" ":Label" "$LABEL"
   plist_set_string "$p" ":ProgramArguments:0" "$DIR/bin/hitman"
   plist_set_string "$p" ":StandardErrorPath" "$LOG_ERR"
   plist_set_string "$p" ":StandardOutPath" "$LOG_OUT"
   plist_set_string "$p" ":WorkingDirectory" "$DIR"
-  plist_set_string "$p" ":EnvironmentVariables:HITMAN_SOCKS" "${HITMAN_SOCKS:-direct}"
-  plist_set_string "$p" ":EnvironmentVariables:HITMAN_ALLOW_HOSTS" "${HITMAN_ALLOW_HOSTS:-${HITMAN_DOMAINS:-$DEFAULT_HITMAN_DOMAINS}}"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_UPSTREAM_PROXY" "$(effective_upstream_proxy)"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_ALLOW_HOSTS" "${HITMAN_ALLOW_HOSTS:-$(effective_domains)}"
+  plist_set_string "$p" ":EnvironmentVariables:HOME" "$HOME"
 }
 
-# sing-box integration — supports two deployment modes:
-#   sfm : SFM.app (NetworkExtension); config lives in the group container, reload = reconnect the profile.
-#   cli : `sing-box run -c <cfg>` (manual or under launchd); reload = restart that process/service.
-# Mode + paths are auto-detected but fully overridable by HITMAN_SB_* env.
-SB_BIN="${HITMAN_SB_BIN:-/opt/homebrew/bin/sing-box}"
-SB_MODE="${HITMAN_SB_MODE:-auto}"                      # sfm | cli | auto
-TUN_INBOUND="${HITMAN_TUN_INBOUND:-tun-in}"            # inbound tag the redirect rule scopes to
-DIRECT_OUTBOUND="${HITMAN_DIRECT_OUTBOUND:-DIRECT}"    # a direct (non-proxy) outbound tag in the sing-box config
-SB_CONFIG_ENV="${HITMAN_SB_CONFIG:-}"
-SB_RELOAD_ENV="${HITMAN_SB_RELOAD:-}"
-SB_LAUNCHD_ENV="${HITMAN_SB_LAUNCHD:-}"
-SFM_CFG="$HOME/Library/Group Containers/287TTNZF8L.io.nekohasekai.sfavt/configs/config_2.json"
-SB_CFG=""                                             # resolved lazily by sb_resolve
-DEFAULT_HITMAN_DOMAINS="chatgpt.com,api.anthropic.com,generativelanguage.googleapis.com,aiplatform.googleapis.com"
-DEFAULT_HITMAN_DOMAIN_SUFFIXES="aiplatform.googleapis.com"
-DEFAULT_HITMAN_PROCESSES="codex,claude,claude.exe,gemini,omp,pi,agy"
-HITMAN_DOMAINS_EFFECTIVE="${HITMAN_DOMAINS-$DEFAULT_HITMAN_DOMAINS}"
-HITMAN_DOMAIN_SUFFIXES_EFFECTIVE="${HITMAN_DOMAIN_SUFFIXES-$DEFAULT_HITMAN_DOMAIN_SUFFIXES}"
-HITMAN_PROCESSES_EFFECTIVE="${HITMAN_PROCESSES-$DEFAULT_HITMAN_PROCESSES}"
-
-# The redirect rule. outbound=DIRECT is REQUIRED: after override_address/port rewrite
-# the destination to 127.0.0.1:PORT, sing-box must dial it locally — without an
-# explicit direct outbound it falls to route.final (a proxy node), which then tries
-# to reach 127.0.0.1:PORT on the remote server and the connection is reset.
-# Idempotency key is override_port == PORT.
-
-die() { echo "hitman: $*" >&2; exit 1; }
-need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
-
-json_array_from_csv() {
-  jq -Rn --arg csv "$1" '$csv | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""))'
-}
-
-redirect_rule_json() {
-  local domains suffixes processes
-  domains="$(json_array_from_csv "$HITMAN_DOMAINS_EFFECTIVE")"
-  suffixes="$(json_array_from_csv "$HITMAN_DOMAIN_SUFFIXES_EFFECTIVE")"
-  processes="$(json_array_from_csv "$HITMAN_PROCESSES_EFFECTIVE")"
-  jq -cn \
-    --arg inbound "$TUN_INBOUND" \
-    --arg outbound "$DIRECT_OUTBOUND" \
-    --argjson domains "$domains" \
-    --argjson suffixes "$suffixes" \
-    --argjson processes "$processes" \
-    --argjson port "$PORT" \
-    '{action:"route",inbound:[$inbound],domain:$domains,outbound:$outbound,override_address:"127.0.0.1",override_port:$port}
-     + (if ($suffixes | length) > 0 then {domain_suffix:$suffixes} else {} end)
-     + (if ($processes | length) > 0 then {process_name:$processes} else {} end)'
+render_net_plist() {
+  local p="$1"
+  plist_set_string "$p" ":Label" "$NET_LABEL"
+  plist_set_string "$p" ":ProgramArguments:0" "$DIR/bin/hitman"
+  plist_set_string "$p" ":ProgramArguments:1" "netd"
+  plist_set_string "$p" ":StandardErrorPath" "$NET_LOG_ERR"
+  plist_set_string "$p" ":StandardOutPath" "$NET_LOG_OUT"
+  plist_set_string "$p" ":WorkingDirectory" "$DIR"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_UPSTREAM_PROXY" "$(effective_upstream_proxy)"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_DOMAINS" "$(effective_domains)"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_DOMAIN_SUFFIXES" "$(effective_domain_suffixes)"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_PROCESSES" "$(effective_processes)"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_RESOLVER_DOMAINS" "$(effective_resolver_domains)"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_MITM_ADDR" "${HITMAN_MITM_ADDR:-127.0.0.1:$PORT}"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_NETD_DNS" "${HITMAN_NETD_DNS:-127.0.0.1:$DNS_PORT}"
+  plist_set_string "$p" ":EnvironmentVariables:HITMAN_DNS_UPSTREAM" "${HITMAN_DNS_UPSTREAM:-1.1.1.1:53}"
+  plist_set_string "$p" ":EnvironmentVariables:HOME" "$HOME"
 }
 
 cmd_build() {
   need go
-  ( cd "$DIR" && go build -trimpath -o bin/hitman . )
-  echo "built $DIR/bin/hitman"
+  mkdir -p "$DIR/bin"
+  ( cd "$DIR" && go build -tags with_gvisor -trimpath -o bin/hitman . )
+  echo "built $DIR/bin/hitman (with_gvisor)"
+}
+
+cmd_install_user() {
+  mkdir -p "$DIR/logs" "$(dirname "$PLIST_DST")"
+  cp "$PLIST_SRC" "$PLIST_DST"
+  render_user_plist "$PLIST_DST"
+  launchctl bootout "$GUI/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "$GUI" "$PLIST_DST" 2>/dev/null || true
+  launchctl kickstart -k "$GUI/$LABEL"
+  echo "installed + started user service $LABEL"
+}
+
+cmd_install_net() {
+  mkdir -p "$DIR/logs"
+  local tmp
+  tmp="$(mktemp)"
+  cp "$NET_PLIST_SRC" "$tmp"
+  render_net_plist "$tmp"
+  sudo mkdir -p "$(dirname "$NET_PLIST_DST")"
+  sudo cp "$tmp" "$NET_PLIST_DST"
+  rm -f "$tmp"
+  sudo chown root:wheel "$NET_PLIST_DST"
+  sudo chmod 644 "$NET_PLIST_DST"
+  sudo launchctl bootout "system/$NET_LABEL" 2>/dev/null || true
+  sudo launchctl bootstrap system "$NET_PLIST_DST"
+  sudo launchctl kickstart -k "system/$NET_LABEL"
+  echo "installed + started root service $NET_LABEL"
 }
 
 cmd_install() {
-  mkdir -p "$DIR/logs" "$(dirname "$PLIST_DST")"
-  cp "$PLIST_SRC" "$PLIST_DST"
-  render_launchd_plist "$PLIST_DST"
-  launchctl bootstrap "$GUI" "$PLIST_DST" 2>/dev/null || true
-  launchctl kickstart -k "$GUI/$LABEL"
-  echo "installed + started launchd service $LABEL"
+  cmd_build
+  cmd_install_user
+  cmd_install_net
+}
+
+cleanup_resolvers() {
+  local d path
+  IFS=',' read -r -a domains <<<"$(effective_resolver_domains)"
+  for d in "${domains[@]}"; do
+    d="${d//[[:space:]]/}"
+    [ -n "$d" ] || continue
+    path="/etc/resolver/$d"
+    if sudo test -f "$path" && sudo grep -qF "$RESOLVER_MARKER" "$path"; then
+      sudo rm -f "$path"
+    fi
+  done
 }
 
 cmd_uninstall() {
   launchctl bootout "$GUI/$LABEL" 2>/dev/null || true
+  sudo launchctl bootout "system/$NET_LABEL" 2>/dev/null || true
   rm -f "$PLIST_DST"
-  echo "uninstalled launchd service $LABEL"
+  sudo rm -f "$NET_PLIST_DST"
+  cleanup_resolvers
+  echo "uninstalled $LABEL and $NET_LABEL"
 }
 
-cmd_restart() { launchctl kickstart -k "$GUI/$LABEL"; echo "restarted $LABEL"; }
+cmd_restart() {
+  launchctl kickstart -k "$GUI/$LABEL"
+  sudo launchctl kickstart -k "system/$NET_LABEL"
+  echo "restarted $LABEL and $NET_LABEL"
+}
 
-# egress <socks [addr] | direct>: set how hitman reaches the upstream.
-#   socks : dial via sing-box socks-in (default 127.0.0.1:2333) — needs the socks port reachable.
-#   direct: dial upstream straight and let the sing-box TUN capture it — use when
-#           strict_route blocks the socks inbound. Loop-safe only with process-scoped redirect.
-cmd_egress() {
-  local mode="${1:-}" addr="${2:-127.0.0.1:2333}" val
+cmd_on() {
+  cmd_build
+  cmd_install_user
+  cmd_install_net
+}
+
+cmd_off() {
+  sudo launchctl bootout "system/$NET_LABEL" 2>/dev/null || true
+  cleanup_resolvers
+  echo "capture disabled (netd stopped, hitman resolver files removed)"
+}
+
+cmd_upstream() {
+  local mode="${1:-}" addr="${2:-}" val
   case "$mode" in
-    direct) val="direct" ;;
-    socks)  val="$addr" ;;
-    *) die "usage: hitman egress <socks [addr] | direct>" ;;
+    socks|socks5) val="socks5://${addr:-127.0.0.1:2333}" ;;
+    http|mixed)   val="http://${addr:-127.0.0.1:2334}" ;;
+    direct)       die "netd requires a sing-box upstream proxy; direct is not supported in TUN mode" ;;
+    *)            die "usage: hitman upstream <socks [addr] | http [addr]>" ;;
   esac
-  for p in "$PLIST_SRC" "$PLIST_DST"; do
+  for p in "$PLIST_SRC" "$PLIST_DST" "$NET_PLIST_SRC"; do
     [ -f "$p" ] || continue
-    plist_set_string "$p" ":EnvironmentVariables:HITMAN_SOCKS" "$val"
+    plist_set_string "$p" ":EnvironmentVariables:HITMAN_UPSTREAM_PROXY" "$val"
   done
-  echo "egress set to: $val"
-  if [ -f "$PLIST_DST" ]; then
-    launchctl bootout "$GUI/$LABEL" 2>/dev/null || true
-    launchctl bootstrap "$GUI" "$PLIST_DST" 2>/dev/null || true
-    launchctl kickstart -k "$GUI/$LABEL"
-    echo "restarted $LABEL"
+  if [ -f "$NET_PLIST_DST" ]; then
+    plist_set_string_sudo "$NET_PLIST_DST" ":EnvironmentVariables:HITMAN_UPSTREAM_PROXY" "$val"
+  fi
+  echo "upstream proxy set to: $val"
+  if [ -f "$PLIST_DST" ] && [ -f "$NET_PLIST_DST" ]; then
+    cmd_restart
   fi
 }
 
+proxy_host_port() {
+  local proxy="${1#socks5://}"
+  proxy="${proxy#socks://}"
+  proxy="${proxy#http://}"
+  echo "$proxy"
+}
+
+print_launchd_state() {
+  local label="$1" name="$2" out
+  if out="$(launchctl print "$label" 2>/dev/null)"; then
+    awk -v name="$name" '/state = /{print "  " name ": " $0; found=1; exit} END{if(!found) print "  " name ": loaded"}' <<<"$out"
+  else
+    echo "  $name: not loaded"
+  fi
+}
+
+cmd_status() {
+  local proxy hp host port
+  echo "== launchd =="
+  print_launchd_state "$GUI/$LABEL" "user"
+  print_launchd_state "system/$NET_LABEL" "netd"
+
+  echo "== listeners =="
+  if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then echo "  mitm :$PORT listening"; else echo "  mitm :$PORT NOT listening"; fi
+  if lsof -nP -iUDP:"$DNS_PORT" >/dev/null 2>&1 || lsof -nP -iTCP:"$DNS_PORT" -sTCP:LISTEN >/dev/null 2>&1; then echo "  dns  :$DNS_PORT listening"; else echo "  dns  :$DNS_PORT NOT listening"; fi
+
+  echo "== upstream proxy =="
+  proxy="$(effective_upstream_proxy)"
+  if [ -f "$NET_PLIST_DST" ]; then
+    proxy="$("$PB" -c 'Print :EnvironmentVariables:HITMAN_UPSTREAM_PROXY' "$NET_PLIST_DST" 2>/dev/null || echo "$proxy")"
+  fi
+  hp="$(proxy_host_port "$proxy")"
+  host="${hp%:*}"
+  port="${hp##*:}"
+  echo "  $proxy"
+  if nc -z "$host" "$port" >/dev/null 2>&1; then echo "  reachable"; else echo "  NOT reachable"; fi
+
+  echo "== route =="
+  if netstat -rn -f inet | awk '$1 ~ /^198\\.18\\./ || $1 == "198.18/15" || $1 == "198.18.0.0/15" {found=1; print "  " $0} END{exit !found}'; then
+    :
+  else
+    echo "  fake-IP route not found"
+  fi
+
+  echo "== resolvers =="
+  local d path
+  IFS=',' read -r -a domains <<<"$(effective_resolver_domains)"
+  for d in "${domains[@]}"; do
+    d="${d//[[:space:]]/}"
+    [ -n "$d" ] || continue
+    path="/etc/resolver/$d"
+    if [ -f "$path" ] && grep -qF "$RESOLVER_MARKER" "$path"; then
+      echo "  $d -> hitman"
+    elif [ -f "$path" ]; then
+      echo "  $d -> exists but not hitman-managed"
+    else
+      echo "  $d -> missing"
+    fi
+  done
+
+  echo "== intercept targets =="
+  echo "  domains: $(effective_domains)"
+  echo "  domain_suffixes: $(effective_domain_suffixes)"
+  echo "  processes: $(effective_processes)"
+
+  echo "== CA trust =="
+  if security find-certificate -c "hitman CA" /Library/Keychains/System.keychain >/dev/null 2>&1; then echo "  trusted"; else echo "  NOT trusted"; fi
+}
+
+cmd_logs() {
+  tail -f "$LOG_ERR" "$LOG_OUT" "$NET_LOG_ERR" "$NET_LOG_OUT"
+}
+
 cmd_ca_trust() {
-  [ -f "$CA_PEM" ] || die "CA not found at $CA_PEM (run the service once first: ./hitman install)"
+  [ -f "$CA_PEM" ] || die "CA not found at $CA_PEM (start the service once first: ./hitman install)"
   echo "adding CA to System keychain (admin password required)..."
   sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$CA_PEM"
   echo "CA trusted"
@@ -141,159 +268,58 @@ cmd_ca_untrust() {
   echo "CA trust removed"
 }
 
-# sb_cli_config sets SB_CFG to the first existing sing-box CLI config; returns 1 if none.
-sb_cli_config() {
-  local c
-  for c in "$SB_CONFIG_ENV" "$HOME/.config/sing-box/config.json" \
-           /opt/homebrew/etc/sing-box/config.json /usr/local/etc/sing-box/config.json /etc/sing-box/config.json; do
-    if [ -n "$c" ] && [ -f "$c" ]; then SB_CFG="$c"; return 0; fi
-  done
-  return 1
-}
-
-# sb_resolve sets SB_CFG + SB_MODE from env / auto-detection; returns 1 if no config found.
-sb_resolve() {
-  if [ -n "$SB_CONFIG_ENV" ]; then
-    SB_CFG="$SB_CONFIG_ENV"
-    [ -f "$SB_CFG" ] || return 1
-    case "$SB_MODE" in sfm|cli) : ;; *) case "$SB_CFG" in *sfavt*) SB_MODE=sfm ;; *) SB_MODE=cli ;; esac ;; esac
-    return 0
+codex_token() {
+  local token="${CODEX_TOKEN:-}"
+  if [ -z "$token" ]; then
+    need jq
+    token="$(jq -r '.tokens.access_token // empty' "$HOME/.codex/auth.json" 2>/dev/null || true)"
   fi
-  case "$SB_MODE" in
-    sfm) SB_CFG="$SFM_CFG"; [ -f "$SB_CFG" ] || return 1; return 0 ;;
-    cli) sb_cli_config; return $? ;;
-    *)   if [ -f "$SFM_CFG" ]; then SB_MODE=sfm; SB_CFG="$SFM_CFG"; return 0; fi
-         SB_MODE=cli; sb_cli_config; return $? ;;
-  esac
+  [ -n "$token" ] || die "no token: set CODEX_TOKEN or ensure ~/.codex/auth.json has .tokens.access_token"
+  echo "$token"
 }
-
-# sb_reload applies the just-written config to the running sing-box (mode-specific).
-sb_reload() {
-  if [ -n "$SB_RELOAD_ENV" ]; then
-    echo "reloading sing-box via HITMAN_SB_RELOAD..."
-    eval "$SB_RELOAD_ENV"
-    return 0
-  fi
-  case "$SB_MODE" in
-    sfm)
-      echo "NOTE: reload SFM — reconnect the active profile in the SFM app for the change to apply." ;;
-    cli)
-      if [ -n "$SB_LAUNCHD_ENV" ]; then
-        launchctl kickstart -k "$GUI/$SB_LAUNCHD_ENV" 2>/dev/null \
-          || sudo launchctl kickstart -k "system/$SB_LAUNCHD_ENV" 2>/dev/null \
-          || echo "WARN: could not kickstart launchd service $SB_LAUNCHD_ENV"
-        echo "restarted sing-box launchd service $SB_LAUNCHD_ENV"
-      elif pgrep -x sing-box >/dev/null 2>&1; then
-        echo "NOTE: restart your sing-box CLI to load the new config (it does not hot-reload the config file):"
-        echo "      sudo $SB_BIN run -c \"$SB_CFG\"   (or set HITMAN_SB_RELOAD / HITMAN_SB_LAUNCHD)"
-      else
-        echo "NOTE: sing-box does not appear to be running; start it with the updated config."
-      fi ;;
-  esac
-}
-
-# _sb_apply <jq-program> [jq-args...]: resolve config, back up, run the jq transform,
-# validate with `sing-box check`, atomically swap it in, then reload (mode-aware).
-_sb_apply() {
-  local prog="$1"; shift
-  need jq
-  [ -x "$SB_BIN" ] || die "sing-box not found at $SB_BIN (set HITMAN_SB_BIN)"
-  sb_resolve || die "no sing-box config found; set HITMAN_SB_CONFIG=/path/to/config.json"
-  local ts tmp
-  ts="$(date +%Y%m%dT%H%M%S)"
-  cp "$SB_CFG" "$SB_CFG.bak-hitman-$ts"
-  tmp="$(mktemp)"
-  jq "$@" "$prog" "$SB_CFG" >"$tmp" || { rm -f "$tmp"; die "jq transform failed"; }
-  "$SB_BIN" check -c "$tmp" || { rm -f "$tmp"; die "sing-box check failed; config unchanged (backup: $SB_CFG.bak-hitman-$ts)"; }
-  mv "$tmp" "$SB_CFG"
-  echo "[$SB_MODE] sing-box config updated: $SB_CFG (backup: $SB_CFG.bak-hitman-$ts)"
-  sb_reload
-}
-
-cmd_singbox_patch() {
-  # Remove any prior hitman rule (match on override_port) then insert the current
-  # one right after the leading sniff/hijack-dns rules, so re-running `on` upgrades
-  # the rule in place and it takes priority over real routing rules (first-match wins).
-  local redirect_rule
-  need jq
-  redirect_rule="$(redirect_rule_json)"
-  _sb_apply '
-    def leadlen($rules):
-      reduce $rules[] as $x ({n:0, stop:false};
-        if .stop then .
-        elif ($x.action == "sniff" or $x.action == "hijack-dns") then {n:(.n+1), stop:false}
-        else {n:.n, stop:true} end).n;
-    (.route.rules | map(select(.override_port? != '"$PORT"'))) as $c
-    | leadlen($c) as $at
-    | .route.rules = ($c[0:$at] + [$r] + $c[$at:])
-  ' --argjson r "$redirect_rule"
-}
-
-cmd_singbox_unpatch() {
-  _sb_apply '.route.rules |= map(select(.override_port? != '"$PORT"'))'
-}
-
-cmd_on()  { cmd_singbox_patch; }
-cmd_off() { cmd_singbox_unpatch; }
-
-cmd_status() {
-  echo "== launchd =="
-  launchctl print "$GUI/$LABEL" 2>/dev/null | awk '/state = /{print; exit}' || echo "  not loaded"
-  echo "== listener :$PORT =="
-  if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then echo "  listening"; else echo "  NOT listening"; fi
-  echo "== egress =="
-  local eg="127.0.0.1:2333"
-  [ -f "$PLIST_DST" ] && eg="$("$PB" -c 'Print :EnvironmentVariables:HITMAN_SOCKS' "$PLIST_DST" 2>/dev/null || echo '127.0.0.1:2333')"
-  case "$eg" in ""|direct|none|off|-) echo "  direct (via TUN)";; *) echo "  socks $eg";; esac
-  echo "== sing-box socks :$SOCKS_PORT =="
-  if nc -z 127.0.0.1 "$SOCKS_PORT" >/dev/null 2>&1; then echo "  reachable"; else echo "  NOT reachable (ok if egress=direct)"; fi
-  echo "== sing-box config =="
-  if sb_resolve; then echo "  mode=$SB_MODE  config=$SB_CFG"; else echo "  NOT found (set HITMAN_SB_CONFIG)"; fi
-  echo "== redirect rule =="
-  local rule=""
-  if command -v jq >/dev/null 2>&1 && [ -n "$SB_CFG" ] && [ -f "$SB_CFG" ]; then
-    rule="$(jq -c '.route.rules[]? | select(.override_port? == '"$PORT"')' "$SB_CFG" 2>/dev/null | tail -n 1)"
-  fi
-  if [ -n "$rule" ]; then echo "  present (hitman ON)"; else echo "  absent (hitman OFF / direct)"; fi
-  echo "== intercept targets =="
-  echo "  desired domains: $HITMAN_DOMAINS_EFFECTIVE"
-  if [ -n "$HITMAN_DOMAIN_SUFFIXES_EFFECTIVE" ]; then echo "  desired domain_suffixes: $HITMAN_DOMAIN_SUFFIXES_EFFECTIVE"; fi
-  if [ -n "$HITMAN_PROCESSES_EFFECTIVE" ]; then echo "  desired processes: $HITMAN_PROCESSES_EFFECTIVE"; else echo "  desired processes: <host-level>"; fi
-  if [ -n "$rule" ]; then
-    echo "$rule" | jq -r '"  actual domains: " + ((.domain // []) | join(","))'
-    echo "$rule" | jq -r 'if (.domain_suffix? // [] | length) > 0 then "  actual domain_suffixes: " + ((.domain_suffix // []) | join(",")) else "  actual domain_suffixes: <none>" end'
-    echo "$rule" | jq -r 'if (.process_name? // [] | length) > 0 then "  actual processes: " + ((.process_name // []) | join(",")) else "  actual processes: <host-level>" end'
-  fi
-  echo "== CA trust =="
-  if security find-certificate -c "hitman CA" /Library/Keychains/System.keychain >/dev/null 2>&1; then echo "  trusted"; else echo "  NOT trusted"; fi
-}
-
-cmd_logs() { tail -f "$LOG_ERR" "$LOG_OUT"; }
 
 cmd_smoke() {
-  need curl; need jq
+  need curl
   [ -f "$CA_PEM" ] || die "CA not found at $CA_PEM"
-  local token="${CODEX_TOKEN:-}"
-  if [ -z "$token" ]; then token="$(jq -r '.tokens.access_token // empty' "$HOME/.codex/auth.json" 2>/dev/null || true)"; fi
-  [ -n "$token" ] || die "no token: set CODEX_TOKEN or ensure ~/.codex/auth.json has .tokens.access_token"
-  if ! nc -z 127.0.0.1 "$SOCKS_PORT" >/dev/null 2>&1; then
-    echo "WARN: socks $SOCKS_PORT not reachable. If egress=socks this smoke will fail;" >&2
-    echo "      if strict_route blocks the socks inbound, switch: ./hitman egress direct" >&2
+  if ! lsof -nP -iUDP:"$DNS_PORT" >/dev/null 2>&1; then
+    die "netd DNS is not listening on :$DNS_PORT (run ./hitman on)"
   fi
-  echo "sending gpt-5.5 stream through hitman (chatgpt.com -> 127.0.0.1:$PORT)..."
-  # --connect-to keeps the URL host as chatgpt.com:443 (correct upstream port + Host header)
-  # while dialing local hitman; --resolve would leak :$PORT into Host and upstream.
-  local out
+  local token tmp curl_bin out
+  token="$(codex_token)"
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  curl_bin="$(command -v curl)"
+  cp "$curl_bin" "$tmp/codex"
+  chmod +x "$tmp/codex"
+  echo "sending gpt-5.5 stream through DNS/TUN/netd as process name 'codex'..."
+  out="$("$tmp/codex" -sN --max-time 300 \
+    --cacert "$CA_PEM" \
+    "https://chatgpt.com/backend-api/codex/responses" \
+    -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+    -H 'User-Agent: codex_cli_rs/0.142.5 (hitman smoke)' \
+    -d '{"model":"gpt-5.5","stream":true,"store":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Reply with the single word ok"}]}],"reasoning":{"effort":"low"}}' || true)"
+  if grep -q 'proxy_rounds\|response.completed' <<<"$out"; then
+    echo "SMOKE PASS: DNS/TUN/netd -> hitman relayed a terminal response.completed"
+  else
+    echo "SMOKE FAIL: no terminal event seen. Last lines:"; tail -n 5 <<<"$out"
+    return 1
+  fi
+}
+
+cmd_smoke_mitm() {
+  need curl
+  [ -f "$CA_PEM" ] || die "CA not found at $CA_PEM"
+  local token out
+  token="$(codex_token)"
+  echo "sending gpt-5.5 stream directly to MITM listener with curl --connect-to..."
   out="$(curl -sN --max-time 300 \
     --connect-to "chatgpt.com:443:127.0.0.1:$PORT" --cacert "$CA_PEM" \
     "https://chatgpt.com/backend-api/codex/responses" \
     -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
-    -H 'User-Agent: codex_cli_rs/0.142.5 (smoke)' \
+    -H 'User-Agent: codex_cli_rs/0.142.5 (hitman smoke-mitm)' \
     -d '{"model":"gpt-5.5","stream":true,"store":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Reply with the single word ok"}]}],"reasoning":{"effort":"low"}}' || true)"
-  # With folding on you get metadata.proxy_rounds; with the default (max_continue=0)
-  # the fold path still stamps response.completed — treat either terminal as pass.
   if grep -q 'proxy_rounds\|response.completed' <<<"$out"; then
-    echo "SMOKE PASS: hitman relayed a terminal response.completed (proxy_rounds present iff folding enabled)"
+    echo "SMOKE PASS: MITM relayed a terminal response.completed"
   else
     echo "SMOKE FAIL: no terminal event seen. Last lines:"; tail -n 5 <<<"$out"
     return 1
@@ -301,36 +327,34 @@ cmd_smoke() {
 }
 
 cmd_init() {
-  cmd_build
   cmd_install
   sleep 1
   cmd_ca_trust
-  cmd_singbox_patch
   cmd_status
-  cmd_smoke || echo "(smoke failed — see status above and README troubleshooting)"
+  cmd_smoke || echo "(smoke failed -- see status above and README troubleshooting)"
 }
 
 usage() {
   cat <<EOF
-hitman — Human In The Middle · watch the Agent Network
+hitman - Human In The Middle · watch the Agent Network
 
 Usage: ./hitman <command>
 
-  init             build + install + trust CA + patch sing-box + status + smoke (one-time)
-  build            go build -> bin/hitman
-  install          copy plist + launchd bootstrap + start (auto-creates CA on first run)
-  uninstall        stop + remove launchd service
-  restart          kickstart the service
-  egress <mode>    set upstream egress: 'socks [addr]' (default 2333) or 'direct' (via TUN)
+  init             build + install user/root services + trust CA + status + smoke
+  build            go build -tags with_gvisor -> bin/hitman
+  install          build + install/start user MITM and root netd
+  uninstall        stop/remove both launchd services and hitman resolver files
+  restart          kickstart both services
+  on               build + start capture (same service path as install)
+  off              stop root netd and remove hitman resolver files
+  upstream         set upstream proxy: socks [addr] or http [addr]
+  egress           alias for upstream
   ca-trust         add local CA to System keychain (sudo)
   ca-untrust       remove local CA from System keychain (sudo)
-  on               add sing-box redirect rule (configured agent processes -> hitman)
-  off              remove sing-box redirect rule
-  singbox-patch    same as 'on' (idempotent, sing-box check + backup)
-  singbox-unpatch  same as 'off'
-  status           show launchd / listener / socks / rule / CA state
-  logs             tail service logs
-  smoke            send a gpt-5.5 stream through hitman and check for a terminal response
+  status           show services, listeners, proxy, route, resolvers, CA state
+  logs             tail MITM and netd logs
+  smoke            live DNS/TUN/netd smoke using a temporary process named codex
+  smoke-mitm       direct MITM-only smoke using curl --connect-to
 EOF
 }
 
@@ -340,16 +364,15 @@ case "${1:-}" in
   install) cmd_install ;;
   uninstall) cmd_uninstall ;;
   restart) cmd_restart ;;
-  egress) cmd_egress "${2:-}" "${3:-}" ;;
-  ca-trust) cmd_ca_trust ;;
-  ca-untrust) cmd_ca_untrust ;;
   on) cmd_on ;;
   off) cmd_off ;;
-  singbox-patch) cmd_singbox_patch ;;
-  singbox-unpatch) cmd_singbox_unpatch ;;
+  upstream|egress) cmd_upstream "${2:-}" "${3:-}" ;;
+  ca-trust) cmd_ca_trust ;;
+  ca-untrust) cmd_ca_untrust ;;
   status) cmd_status ;;
   logs) cmd_logs ;;
   smoke) cmd_smoke ;;
+  smoke-mitm) cmd_smoke_mitm ;;
   ""|-h|--help|help) usage ;;
   *) usage; exit 1 ;;
 esac

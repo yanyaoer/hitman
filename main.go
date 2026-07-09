@@ -18,15 +18,23 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 	log.SetPrefix("hitman ")
 
-	// This binary is the gateway server and takes no subcommands; control commands
-	// (init/on/off/status/...) live in the `hitman` script. Guard against the easy
-	// mix-up so `./hitman init` gives a hint instead of trying to bind the port.
 	if len(os.Args) > 1 {
-		fmt.Fprintln(os.Stderr, "hitman is the gateway server binary and takes no subcommands.")
+		switch os.Args[1] {
+		case "serve":
+			runServe()
+			return
+		case "netd":
+			runNetd()
+			return
+		}
+		fmt.Fprintln(os.Stderr, "hitman binary subcommands: serve, netd")
 		fmt.Fprintf(os.Stderr, "Did you mean the control script?  ./hitman %s\n", os.Args[1])
 		os.Exit(2)
 	}
+	runServe()
+}
 
+func runServe() {
 	cfg := loadConfig()
 
 	caObj, err := loadOrCreateCA(cfg.CADir)
@@ -53,11 +61,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("fatal: listen %s: %v", cfg.ListenAddr, err)
 	}
-	egress := "direct (via TUN)"
-	if cfg.SocksAddr != "" {
-		egress = "socks " + cfg.SocksAddr
-	}
-	log.Printf("listening on https://%s (egress %s, audit %s, ca %s)", cfg.ListenAddr, egress, cfg.AuditDir, cfg.CADir)
+	log.Printf("listening on https://%s (egress %s, audit %s, ca %s)", cfg.ListenAddr, upstreamLabel(cfg.UpstreamProxy), cfg.AuditDir, cfg.CADir)
 
 	go func() {
 		if err := httpServer.ServeTLS(ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -72,4 +76,12 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpServer.Shutdown(ctx)
+}
+
+func upstreamLabel(proxyAddr string) string {
+	_, label, err := proxyDialContext(proxyAddr, false)
+	if err != nil {
+		return "invalid (" + err.Error() + ")"
+	}
+	return label
 }

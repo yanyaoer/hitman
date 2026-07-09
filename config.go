@@ -20,11 +20,12 @@ const (
 // overridable via HITMAN_* environment variables so the launchd plist / hitman
 // script can tune behaviour without touching code.
 type appConfig struct {
-	ListenAddr string   // TLS listener codex is redirected to
-	SocksAddr  string   // sing-box socks-in used for real egress
-	CADir      string   // holds hitman-ca.pem / .key
-	AuditDir   string   // per-day audit output
-	AllowHosts []string // upstream Host allowlist (exact or ".suffix"); empty = allow all
+	ListenAddr    string   // TLS listener agent traffic is redirected to
+	UpstreamProxy string   // sing-box socks/mixed inbound used for real egress
+	SocksAddr     string   // deprecated alias for old tests/scripts
+	CADir         string   // holds hitman-ca.pem / .key
+	AuditDir      string   // per-day audit output
+	AllowHosts    []string // upstream Host allowlist (exact or ".suffix"); empty = allow all
 
 	MarkerText     string
 	TruncationStep int
@@ -44,9 +45,11 @@ type foldConfig struct {
 }
 
 func loadConfig() appConfig {
+	upstreamProxy := normalizeProxy(envOr("HITMAN_UPSTREAM_PROXY", envOr("HITMAN_SOCKS", "127.0.0.1:2333")))
 	c := appConfig{
 		ListenAddr:     envOr("HITMAN_LISTEN", "127.0.0.1:8471"),
-		SocksAddr:      normalizeSocks(envOr("HITMAN_SOCKS", "127.0.0.1:2333")),
+		UpstreamProxy:  upstreamProxy,
+		SocksAddr:      upstreamProxy,
 		CADir:          envOr("HITMAN_CA_DIR", "ca"),
 		AuditDir:       envOr("HITMAN_AUDIT_DIR", "audit"),
 		AllowHosts:     splitCSV(envOr("HITMAN_ALLOW_HOSTS", defaultAllowHosts)),
@@ -105,18 +108,6 @@ func envBool(key string, def bool) bool {
 		}
 	}
 	return def
-}
-
-// normalizeSocks maps the "direct" sentinels to an empty SocksAddr, which selects
-// direct egress (dial the upstream straight, letting the sing-box TUN capture it).
-// Useful when strict_route makes the socks inbound unreachable from local processes.
-func normalizeSocks(v string) string {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "", "direct", "none", "off", "-":
-		return ""
-	default:
-		return v
-	}
 }
 
 func splitCSV(s string) []string {
